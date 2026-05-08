@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import {
   attachAudioMix,
   resumeAudioContext,
@@ -6,7 +6,7 @@ import {
   setSourceVolume,
   syncExtraToVideo,
 } from "../audioMix";
-import { getExtraBlob } from "../extraBlobs";
+import { getExtraAudioPlaybackUrl } from "../extraBlobs";
 import { useStore } from "../store";
 import { PreviewToolbar } from "./PreviewToolbar";
 import { SubtitleOverlay } from "./SubtitleOverlay";
@@ -29,8 +29,7 @@ export function AudioPreview() {
   const watermark = useStore((s) => s.watermark);
   const trimRange = useStore((s) => s.trimRange);
   const sourceVolume = useStore((s) => s.audio.sourceVolume);
-  const extraAudioId = useStore((s) => s.audio.extraAudioId);
-  const extraVolume = useStore((s) => s.audio.extraVolume);
+  const extras = useStore((s) => s.audio.extras);
   const audioRef = useRef<HTMLAudioElement>(null);
   const stageRef = useRef<HTMLDivElement>(null);
   const [scale, setScale] = useState(1);
@@ -60,17 +59,29 @@ export function AudioPreview() {
     return () => setVideoEl(null);
   }, [audioUrl, setVideoEl]);
 
+  const extrasResolved = useMemo(
+    () => extras
+      .map((e) => {
+        const url = getExtraAudioPlaybackUrl(e.id);
+        return url ? { id: e.id, url, volume: e.volume } : null;
+      })
+      .filter((x): x is { id: string; url: string; volume: number } => x !== null),
+    [extras],
+  );
+  const extrasResolvedKey = extrasResolved.map((e) => `${e.id}|${e.url}`).join(";");
+
   useEffect(() => {
     const a = audioRef.current;
     if (!a || !audioUrl) return;
-    const extraUrl = getExtraBlob(extraAudioId);
-    const mix = attachAudioMix(a, extraUrl);
+    const mix = attachAudioMix(a, extrasResolved);
     mix.srcGain.gain.value = Math.max(0, Math.min(2, sourceVolume));
-    mix.extraGain.gain.value = Math.max(0, Math.min(2, extraVolume));
-  }, [audioUrl, extraAudioId]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [audioUrl, extrasResolvedKey]);
 
   useEffect(() => { setSourceVolume(sourceVolume); }, [sourceVolume]);
-  useEffect(() => { setExtraVolume(extraVolume); }, [extraVolume]);
+  useEffect(() => {
+    for (const e of extras) setExtraVolume(e.id, e.volume);
+  }, [extras]);
 
   useEffect(() => {
     const a = audioRef.current;

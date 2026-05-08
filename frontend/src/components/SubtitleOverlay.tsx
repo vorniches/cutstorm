@@ -54,19 +54,20 @@ export function SubtitleOverlay({ videoRef, renderMode = false, currentTimeOverr
   const setSize = useStore((s) => s.setSize);
   const subtitleTrack = useStore((s) => s.subtitleTrack);
   const trimRange = useStore((s) => s.trimRange);
-  const extraAudioId = useStore((s) => s.audio.extraAudioId);
-  const extraAudioDuration = useStore((s) => s.audio.extraAudioDuration);
+  const extras = useStore((s) => s.audio.extras);
   const storeCurrentTime = useStore((s) => s.currentTime);
 
   const [currentTime, setLocalTime] = useState(0);
   const dragRef = useRef<DragMode>(null);
   const overlayRef = useRef<HTMLDivElement>(null);
 
+  // Loop driver = first extra; its duration is the master timeline length.
+  const driverDuration = extras[0]?.duration ?? 0;
   const trimOut = trimRange.out_sec > 0 ? trimRange.out_sec : 0;
   const loopClipDuration = Math.max(0, trimOut - trimRange.in_sec);
   const loopActive = !!trimRange.loop
-    && extraAudioId !== null
-    && extraAudioDuration > 0
+    && extras.length > 0
+    && driverDuration > 0
     && loopClipDuration > 0;
 
   // requestAnimationFrame loop while playing → smooth karaoke updates

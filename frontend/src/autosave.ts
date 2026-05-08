@@ -21,8 +21,12 @@ function projectSnapshot(s: ReturnType<typeof useStore.getState>) {
     trim_range: s.trimRange,
     audio: {
       source_volume: s.audio.sourceVolume,
-      extra_audio_id: s.audio.extraAudioId,
-      extra_volume: s.audio.extraVolume,
+      extras: s.audio.extras.map((e) => ({
+        id: e.id,
+        volume: e.volume,
+        name: e.name,
+        duration: e.duration,
+      })),
     },
     use_subs: s.useSubs,
     display_mode: s.style.mode,

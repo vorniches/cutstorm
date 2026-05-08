@@ -66,17 +66,17 @@ test("persist migrate: v2 shape upgrades to current version without crashing", a
     const raw = localStorage.getItem("cutstorm-state");
     return raw ? JSON.parse(raw) : null;
   });
-  expect(migrated?.version).toBe(8);
-  // v8 trimRange has the loop flag.
+  expect(migrated?.version).toBe(9);
+  // v8 added trimRange.loop; v9 keeps it.
   expect(migrated?.state?.trimRange).toEqual({ in_sec: 0, out_sec: 0, loop: false });
+  // v9 audio shape: { sourceVolume, extras: [] } — legacy fields are absorbed.
   expect(migrated?.state?.audio).toMatchObject({
     sourceVolume: 1.0,
-    extraAudioId: null,
-    extraVolume: 1.0,
+    extras: [],
   });
-  // v8 also seeds the per-track segment lists and the active-track flag.
+  // v8 seeded per-track segment lists; v9 turned segmentsExtra into a Record.
   expect(Array.isArray(migrated?.state?.segmentsSource)).toBe(true);
-  expect(migrated?.state?.segmentsExtra).toEqual([]);
+  expect(migrated?.state?.segmentsExtra).toEqual({});
   expect(migrated?.state?.subtitleTrack).toBe("source");
 });
 
@@ -178,7 +178,7 @@ test("extra audio plays through WebAudio mix in preview", async ({ page }) => {
 
   await page.getByTestId("extra-track-add").click();
   await page.getByTestId("extra-file-input").setInputFiles(BG_TONE);
-  await expect(page.getByTestId("extra-track-info")).toBeVisible({ timeout: 30_000 });
+  await expect(page.locator(`[data-testid^="extra-track-info-"]`).first()).toBeVisible({ timeout: 30_000 });
 
   // Click our custom toolbar play. resumeAudioContext fires inside the
   // click handler — same user-gesture tick — so the AudioContext should
@@ -230,7 +230,7 @@ test("extra audio upload → exported mp4 contains mixed audio", async ({
   // Click "+ Add audio track" and pick the fixture.
   await page.getByTestId("extra-track-add").click();
   await page.getByTestId("extra-file-input").setInputFiles(BG_TONE);
-  await expect(page.getByTestId("extra-track-info")).toBeVisible({ timeout: 30_000 });
+  await expect(page.locator(`[data-testid^="extra-track-info-"]`).first()).toBeVisible({ timeout: 30_000 });
 
   // Pin the trim to the first 10s so duration matches the tone length.
   const bar = page.getByTestId("trim-bar");

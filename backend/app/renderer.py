@@ -159,12 +159,15 @@ def _ffmpeg_cmd_video(
     trim_in: float = 0.0,
     trim_duration: float | None = None,
     source_volume: float = 1.0,
-    extra_audio: Path | None = None,
-    extra_volume: float = 1.0,
+    extras: list[tuple[Path, float]] | None = None,
     source_has_audio: bool = True,
     loop_total_duration: float | None = None,
 ) -> list[str]:
     """Build ffmpeg for: source video → scale/crop + overlay PNG stream + audio.
+
+    `extras` is a list of (file_path, volume) for every extra audio track
+    the user attached. Empty list = no extras. The first entry, if loop is
+    active, drives the total duration via aloop/atrim.
 
     `loop_total_duration` (Coub mode): when set together with `trim_duration`,
     the trimmed source slice is repeated to cover this total duration via the
@@ -172,6 +175,9 @@ def _ffmpeg_cmd_video(
     PNG stream to match `loop_total_duration` (i.e. PNG-frames captured at
     `total_duration * fps`).
     """
+    extras = list(extras or [])
+    n_extras = len(extras)
+
     pre = ""
     if select_expr:
         pre = f"select='{select_expr}',setpts=N/FRAME_RATE/TB,"
@@ -204,63 +210,77 @@ def _ffmpeg_cmd_video(
     else:
         chain = f"[0:v]{pre}scale={target_w}:{target_h}{loop_video_suffix}[bg]"
 
-    has_extra = extra_audio is not None
     # Branches that touch [0:a] must be gated on source_has_audio — otherwise
     # ffmpeg blows up with "stream specifier ':a' matches no streams" on
     # muted source videos (screen-recording etc).
     needs_audio_encode = (
-        has_extra
+        n_extras > 0
         or (source_has_audio and abs(source_volume - 1.0) > 1e-3)
         or (source_has_audio and select_expr is not None)
         or (source_has_audio and loop_active)
     )
 
-    if select_expr and source_has_audio:
-        src_audio = (
-            f"[0:a]aselect='{select_expr}',asetpts=N/SR/TB"
-            f"{loop_audio_suffix},volume={source_volume:.3f}"
-        )
-    elif loop_active and source_has_audio:
-        src_audio = (
-            f"[0:a]{loop_audio_suffix.lstrip(',')}"
-            f",volume={source_volume:.3f}"
-        )
-    else:
-        src_audio = f"[0:a]volume={source_volume:.3f}"
+    # Build per-stream chains. Inputs:
+    #   [0:v] — source video
+    #   [0:a] — source audio (optional, gated by source_has_audio)
+    #   [1:v] — image2pipe (overlay PNGs)
+    #   [2:a], [3:a], ... — extras in order
+    audio_lanes: list[str] = []  # filter chains; each ends in [a_X] label
+    audio_labels: list[str] = []  # labels emitted by the lanes for amix
 
-    if has_extra and source_has_audio:
-        # overlay input is index 1 (image2pipe); extra audio is index 2.
-        # apad pads the SHORTER input with silence so amix doesn't end the
-        # output stream early when extra audio < video clip and -shortest
-        # is in effect later. Without this the encoder closes its stdin
-        # mid-render and the PNG-pipe driver hits BrokenPipeError.
+    if source_has_audio and needs_audio_encode:
+        if select_expr:
+            src_chain = (
+                f"[0:a]aselect='{select_expr}',asetpts=N/SR/TB"
+                f"{loop_audio_suffix},volume={source_volume:.3f},apad[a_src]"
+            )
+        elif loop_active:
+            src_chain = (
+                f"[0:a]{loop_audio_suffix.lstrip(',')}"
+                f",volume={source_volume:.3f},apad[a_src]"
+            )
+        else:
+            src_chain = f"[0:a]volume={source_volume:.3f},apad[a_src]"
+        audio_lanes.append(src_chain)
+        audio_labels.append("[a_src]")
+
+    for i, (_path, vol) in enumerate(extras):
+        idx = 2 + i  # input indexing: source=0, image2pipe=1, extras start at 2
+        label = f"[a_e{i}]"
+        # apad ensures every track outlives the encoder shortest-detect on
+        # any other input (so extra-audio < video doesn't end the output).
+        audio_lanes.append(f"[{idx}:a]volume={vol:.3f},apad{label}")
+        audio_labels.append(label)
+
+    if not audio_labels:
+        # No audio at all — silent output.
+        audio_chain = ""
+        audio_map = ["-an"]
+        acopy: list[str] = []
+    elif len(audio_labels) == 1:
+        # Only one source — rename to [a] without amix.
+        only = audio_lanes[0]
+        # Replace the trailing label with [a].
+        renamed = only.rsplit("[", 1)[0] + "[a]"
+        audio_chain = ";" + renamed
+        audio_map = ["-map", "[a]"]
+        acopy = ["-c:a", "aac", "-b:a", "192k"]
+    else:
+        amix_in = "".join(audio_labels)
         audio_chain = (
-            f";{src_audio},apad[a0];[2:a]volume={extra_volume:.3f},apad[a1];"
-            f"[a0][a1]amix=inputs=2:duration=longest:normalize=0[a]"
+            ";" + ";".join(audio_lanes)
+            + f";{amix_in}amix=inputs={len(audio_labels)}:duration=longest:normalize=0[a]"
         )
         audio_map = ["-map", "[a]"]
         acopy = ["-c:a", "aac", "-b:a", "192k"]
-    elif has_extra:
-        # Source is silent — extra is the only audio. Pad with trailing
-        # silence so the audio stream lasts as long as the video; otherwise
-        # ffmpeg closes its output (and the stdin PNG pipe) the moment
-        # extra runs out, killing the renderer mid-encode.
-        audio_chain = f";[2:a]volume={extra_volume:.3f},apad[a]"
-        audio_map = ["-map", "[a]"]
-        acopy = ["-c:a", "aac", "-b:a", "192k"]
-    elif source_has_audio and needs_audio_encode:
-        audio_chain = f";{src_audio}[a]"
-        audio_map = ["-map", "[a]"]
-        acopy = ["-c:a", "aac", "-b:a", "192k"]
-    elif source_has_audio:
+
+    # Source-audio passthrough copy is only safe when nothing in the
+    # filter graph touches it.
+    if not needs_audio_encode and source_has_audio:
         audio_chain = ""
         audio_map = ["-map", "0:a?"]
         acopy = ["-c:a", "copy"]
-    else:
-        # No source audio and no extra — silent output, skip audio mapping.
-        audio_chain = ""
-        audio_map = ["-an"]
-        acopy = []
+
     filter_complex = f"{chain};[bg][1:v]overlay=format=auto[v]{audio_chain}"
 
     cmd = ["ffmpeg", "-y", "-nostats", "-loglevel", "error"]
@@ -274,11 +294,14 @@ def _ffmpeg_cmd_video(
         "-framerate", str(fps),
         "-i", "pipe:0",
     ]
-    if has_extra:
-        # In loop mode the extra audio drives total length — do not cap it.
+    for path, _vol in extras:
+        # In loop mode the FIRST extra drives total length and must NOT be
+        # capped at trim_duration. The rest also stay uncapped — they're
+        # padded by `apad` so a short tail is fine; capping early would
+        # truncate them prematurely under non-loop mode too.
         if not loop_active and trim_duration is not None and trim_duration > 0.0:
             cmd += ["-t", f"{trim_duration:.3f}"]
-        cmd += ["-i", str(extra_audio)]
+        cmd += ["-i", str(path)]
     cmd += [
         "-filter_complex", filter_complex,
         "-map", "[v]",
@@ -306,29 +329,46 @@ def _ffmpeg_cmd_audio_only(
     trim_in: float = 0.0,
     trim_duration: float | None = None,
     source_volume: float = 1.0,
-    extra_audio: Path | None = None,
-    extra_volume: float = 1.0,
+    extras: list[tuple[Path, float]] | None = None,
 ) -> list[str]:
-    """Build ffmpeg for: synthetic color bg + audio + overlay PNG stream."""
+    """Build ffmpeg for: synthetic color bg + audio + overlay PNG stream.
+
+    Inputs:
+      [0:v] — lavfi color background
+      [1:a] — source audio (the audio-only file the user uploaded)
+      [2:v] — image2pipe (overlay PNGs)
+      [3:a], [4:a], ... — extras
+    """
+    extras = list(extras or [])
     ff_color = hex_to_ffmpeg_color(bg_color)
     color_input = f"color=c={ff_color}:s={target_w}x{target_h}:r={fps}:d={duration:.3f}"
 
-    has_extra = extra_audio is not None
-
     if select_expr:
-        src_audio = f"[1:a]aselect='{select_expr}',asetpts=N/SR/TB,volume={source_volume:.3f}"
-    else:
-        src_audio = f"[1:a]volume={source_volume:.3f}"
-
-    # Inputs: 0=color, 1=audio, 2=image2pipe, [3=extra]
-    if has_extra:
-        audio_chain = (
-            f"{src_audio}[a0];[3:a]volume={extra_volume:.3f}[a1];"
-            f"[a0][a1]amix=inputs=2:duration=first:normalize=0[a]"
+        src_chain = (
+            f"[1:a]aselect='{select_expr}',asetpts=N/SR/TB,"
+            f"volume={source_volume:.3f},apad[a_src]"
         )
     else:
-        audio_chain = f"{src_audio}[a]"
-    audio_map = ["-map", "[a]"]
+        src_chain = f"[1:a]volume={source_volume:.3f},apad[a_src]"
+
+    audio_lanes = [src_chain]
+    audio_labels = ["[a_src]"]
+    for i, (_p, vol) in enumerate(extras):
+        idx = 3 + i  # extras start at input index 3 (after color/src/pipe)
+        label = f"[a_e{i}]"
+        audio_lanes.append(f"[{idx}:a]volume={vol:.3f},apad{label}")
+        audio_labels.append(label)
+
+    if len(audio_labels) == 1:
+        only = audio_lanes[0]
+        renamed = only.rsplit("[", 1)[0] + "[a]"
+        audio_chain = renamed
+    else:
+        amix_in = "".join(audio_labels)
+        audio_chain = (
+            ";".join(audio_lanes)
+            + f";{amix_in}amix=inputs={len(audio_labels)}:duration=longest:normalize=0[a]"
+        )
 
     filter_complex = f"[0:v][2:v]overlay=format=auto[v];{audio_chain}"
 
@@ -342,14 +382,14 @@ def _ffmpeg_cmd_audio_only(
             "-f", "image2pipe",
             "-framerate", str(fps),
             "-i", "pipe:0"]
-    if has_extra:
+    for path, _vol in extras:
         if trim_duration is not None and trim_duration > 0.0:
             cmd += ["-t", f"{trim_duration:.3f}"]
-        cmd += ["-i", str(extra_audio)]
+        cmd += ["-i", str(path)]
     cmd += [
         "-filter_complex", filter_complex,
         "-map", "[v]",
-        *audio_map,
+        "-map", "[a]",
         "-c:v", "libx264",
         "-pix_fmt", "yuv420p",
         "-preset", "slow",
@@ -381,8 +421,7 @@ def render_export(
     trim_in: float = 0.0,
     trim_duration: float | None = None,
     source_volume: float = 1.0,
-    extra_audio: Path | None = None,
-    extra_volume: float = 1.0,
+    extras: list[tuple[Path, float]] | None = None,
     watermark: bool = False,
     source_has_audio: bool = True,
     loop_total_duration: float | None = None,
@@ -406,7 +445,7 @@ def render_export(
             select_expr=select_expr,
             trim_in=trim_in, trim_duration=trim_duration,
             source_volume=source_volume,
-            extra_audio=extra_audio, extra_volume=extra_volume,
+            extras=extras,
         )
     else:
         cmd = _ffmpeg_cmd_video(
@@ -416,7 +455,7 @@ def render_export(
             select_expr=select_expr,
             trim_in=trim_in, trim_duration=trim_duration,
             source_volume=source_volume,
-            extra_audio=extra_audio, extra_volume=extra_volume,
+            extras=extras,
             source_has_audio=source_has_audio,
             loop_total_duration=loop_total_duration,
         )

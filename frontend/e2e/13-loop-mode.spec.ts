@@ -71,12 +71,16 @@ test("persist migrate: v7 → v8 adds loop/segmentsSource/segmentsExtra/subtitle
     const raw = localStorage.getItem("cutstorm-state");
     return raw ? JSON.parse(raw) : null;
   });
-  expect(migrated?.version).toBe(8);
+  expect(migrated?.version).toBe(9);
   expect(migrated?.state?.trimRange).toEqual({ in_sec: 0, out_sec: 0, loop: false });
   expect(Array.isArray(migrated?.state?.segmentsSource)).toBe(true);
   expect(migrated?.state?.segmentsSource.length).toBe(1);
-  expect(migrated?.state?.segmentsExtra).toEqual([]);
+  // v8→v9: segmentsExtra is now a Record keyed by extra id; no extras
+  // means an empty object.
+  expect(migrated?.state?.segmentsExtra).toEqual({});
   expect(migrated?.state?.subtitleTrack).toBe("source");
+  // v9 audio shape: { sourceVolume, extras: [] }.
+  expect(migrated?.state?.audio).toMatchObject({ sourceVolume: 1.0, extras: [] });
 });
 
 test("loop toggle visible after upload, hint shows when no extra audio", async ({
@@ -149,7 +153,7 @@ test("loop=ON + extra audio drives master clock, video stays inside trim slice",
   // Add the 6s tone as extra audio.
   await page.getByTestId("extra-track-add").click();
   await page.getByTestId("extra-file-input").setInputFiles(TONE_6S);
-  await expect(page.getByTestId("extra-track-info")).toBeVisible({ timeout: 30_000 });
+  await expect(page.locator(`[data-testid^="extra-track-info-"]`).first()).toBeVisible({ timeout: 30_000 });
 
   // Engage loop.
   await page.getByTestId("loop-toggle").click();
@@ -160,23 +164,22 @@ test("loop=ON + extra audio drives master clock, video stays inside trim slice",
   // Sample twice with a gap — each sample reads master + video position via
   // the global `__cutstorm_mix` debug handle.
   await page.waitForTimeout(1500);
-  const sample1 = await page.evaluate(() => {
-    const mix = (window as unknown as { __cutstorm_mix?: { extraEl?: HTMLAudioElement } }).__cutstorm_mix;
+  // The audio mix graph now keeps extras as a Map<id, ExtraNode>. Read
+  // the FIRST entry (the loop driver) for the master clock.
+  const readSample = () => page.evaluate(() => {
+    type ExtraNode = { el: HTMLAudioElement };
+    type Mix = { extras?: Map<string, ExtraNode> };
+    const mix = (window as unknown as { __cutstorm_mix?: Mix }).__cutstorm_mix;
+    const first = mix?.extras ? mix.extras.values().next().value as ExtraNode | undefined : undefined;
     const v = document.querySelector<HTMLVideoElement>("[data-testid='preview-video']");
     return {
-      extraT: mix?.extraEl?.currentTime ?? null,
+      extraT: first?.el?.currentTime ?? null,
       videoT: v?.currentTime ?? null,
     };
   });
+  const sample1 = await readSample();
   await page.waitForTimeout(2500);
-  const sample2 = await page.evaluate(() => {
-    const mix = (window as unknown as { __cutstorm_mix?: { extraEl?: HTMLAudioElement } }).__cutstorm_mix;
-    const v = document.querySelector<HTMLVideoElement>("[data-testid='preview-video']");
-    return {
-      extraT: mix?.extraEl?.currentTime ?? null,
-      videoT: v?.currentTime ?? null,
-    };
-  });
+  const sample2 = await readSample();
   // Master (extra) advanced.
   expect(sample1.extraT ?? -1).toBeGreaterThan(0.5);
   expect((sample2.extraT ?? -1)).toBeGreaterThan((sample1.extraT ?? 0));
@@ -221,7 +224,7 @@ test("loop export: 2s slice + 6s tone → output ≈ 6s", async ({ page }) => {
 
   await page.getByTestId("extra-track-add").click();
   await page.getByTestId("extra-file-input").setInputFiles(TONE_6S);
-  await expect(page.getByTestId("extra-track-info")).toBeVisible({ timeout: 30_000 });
+  await expect(page.locator(`[data-testid^="extra-track-info-"]`).first()).toBeVisible({ timeout: 30_000 });
   await page.getByTestId("loop-toggle").click();
   await expect(page.getByTestId("loop-target")).toBeVisible();
 
@@ -272,10 +275,10 @@ test("subtitle track switch: clicking Extra without segments stays disabled", as
 
   await page.getByTestId("extra-track-add").click();
   await page.getByTestId("extra-file-input").setInputFiles(TONE_2S);
-  await expect(page.getByTestId("extra-track-info")).toBeVisible({ timeout: 30_000 });
+  await expect(page.locator(`[data-testid^="extra-track-info-"]`).first()).toBeVisible({ timeout: 30_000 });
 
-  // Without running transcribe-extra, the Extra tab is disabled.
-  const extraTab = page.getByTestId("subtitle-track-extra");
+  // Without running transcribe-extra, the per-id extra tab is disabled.
+  const extraTab = page.locator(`[data-testid^="subtitle-track-extra-"]`).first();
   await expect(extraTab).toBeVisible();
   await expect(extraTab).toBeDisabled();
 });

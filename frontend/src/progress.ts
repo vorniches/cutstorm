@@ -43,15 +43,19 @@ export function openProgressWs(jobId: string): Promise<WebSocket> {
         return;
       }
 
-      // Extra-track transcription mirrors the source-track flow above. The
-      // backend re-tags every event with an `extra_` prefix so we can route
-      // it into segmentsExtra without confusing the source progress bar.
+      // Extra-track transcription mirrors the source-track flow above. Every
+      // event from the backend carries `extra_audio_id` so we can route the
+      // segment into the right per-track list without confusing the source
+      // progress bar.
       if (msg?.phase === "extra_segment" && msg.segment && typeof msg.index === "number") {
-        store.appendExtraSegment(msg.segment, msg.index);
+        const id: string | undefined = msg.extra_audio_id;
+        if (typeof id === "string") {
+          store.appendExtraSegment(id, msg.segment, msg.index);
+          store.setExtraSubsStreamingId(id);
+        }
         if (typeof msg.percent === "number") {
           store.setProgress("transcribe", Math.max(0, Math.min(99, msg.percent)));
         }
-        store.setExtraSubsStreaming(true);
         return;
       }
 
@@ -62,12 +66,14 @@ export function openProgressWs(jobId: string): Promise<WebSocket> {
         if (typeof msg.percent === "number") {
           store.setProgress("transcribe", Math.max(0, Math.min(99, msg.percent)));
         }
-        store.setExtraSubsStreaming(true);
+        if (typeof msg.extra_audio_id === "string") {
+          store.setExtraSubsStreamingId(msg.extra_audio_id);
+        }
         return;
       }
 
       if (msg?.phase === "extra_transcribe_done") {
-        store.setExtraSubsStreaming(false);
+        store.setExtraSubsStreamingId(null);
         store.setJobId(null);
         store.setProgress("done", 100);
         setTimeout(() => ws.close(), 100);
@@ -78,7 +84,7 @@ export function openProgressWs(jobId: string): Promise<WebSocket> {
         msg?.phase === "extra_transcribe_cancelled" ||
         msg?.phase === "extra_transcribe_error"
       ) {
-        store.setExtraSubsStreaming(false);
+        store.setExtraSubsStreamingId(null);
         store.setJobId(null);
         setTimeout(() => ws.close(), 100);
         return;

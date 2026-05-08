@@ -57,8 +57,10 @@ def test_trim_rejects_negative() -> None:
 def test_audio_default() -> None:
     a = AudioMix()
     assert a.source_volume == 1.0
+    assert a.extras == []
+    # Legacy fields are absorbed by the validator and never echoed back.
     assert a.extra_audio_id is None
-    assert a.extra_volume == 1.0
+    assert a.extra_volume is None
 
 
 def test_audio_volume_bounds() -> None:
@@ -67,14 +69,42 @@ def test_audio_volume_bounds() -> None:
     with pytest.raises(ValidationError):
         AudioMix(source_volume=2.5)
     with pytest.raises(ValidationError):
-        AudioMix(extra_volume=-0.1)
+        AudioMix(extras=[{"id": "a" * 16, "volume": -0.1}])
+    with pytest.raises(ValidationError):
+        AudioMix(extras=[{"id": "a" * 16, "volume": 2.5}])
 
 
-def test_audio_valid_range() -> None:
-    a = AudioMix(source_volume=0.5, extra_volume=1.5, extra_audio_id="abc")
+def test_audio_legacy_form_promoted_to_extras() -> None:
+    # Old projects (and backwards-compat clients) send the single-track
+    # form. The validator must rebuild it as a one-element `extras` list.
+    a = AudioMix(source_volume=0.5, extra_volume=1.5, extra_audio_id="a" * 16)
     assert a.source_volume == 0.5
-    assert a.extra_volume == 1.5
-    assert a.extra_audio_id == "abc"
+    assert len(a.extras) == 1
+    assert a.extras[0].id == "a" * 16
+    assert a.extras[0].volume == 1.5
+    assert a.extra_audio_id is None
+    assert a.extra_volume is None
+
+
+def test_audio_new_form_is_passthrough() -> None:
+    a = AudioMix(extras=[
+        {"id": "a" * 16, "volume": 0.7},
+        {"id": "b" * 16, "volume": 1.2},
+    ])
+    assert len(a.extras) == 2
+    assert a.extras[0].volume == 0.7
+    assert a.extras[1].id == "b" * 16
+
+
+def test_audio_new_form_wins_over_legacy() -> None:
+    a = AudioMix(
+        extras=[{"id": "c" * 16, "volume": 0.9}],
+        extra_audio_id="a" * 16,
+        extra_volume=0.1,
+    )
+    assert len(a.extras) == 1
+    assert a.extras[0].id == "c" * 16
+    assert a.extras[0].volume == 0.9
 
 
 # ---------------- _clip_segments_to_trim ----------------
@@ -257,8 +287,10 @@ def test_extra_audio_forwarded_when_present(client, spies, tmp_path):
         assert r.status_code == 200, r.text
         assert "filter_only" in spies
         kw = spies["filter_only"]
-        assert kw["extra_audio"] == extra_path
-        assert abs(kw["extra_volume"] - 0.8) < 1e-6
+        assert "extras" in kw
+        assert len(kw["extras"]) == 1
+        assert kw["extras"][0][0] == extra_path
+        assert abs(kw["extras"][0][1] - 0.8) < 1e-6
     finally:
         extra_path.unlink(missing_ok=True)
         _cleanup(VIDEO_ID)

@@ -6,6 +6,7 @@ import {
 } from "../api";
 import { clearExtraBlob, getExtraBlob, setExtraBlob } from "../extraBlobs";
 import { newJobId, openProgressWs } from "../progress";
+import type { ExtraTrack as ExtraTrackData } from "../store";
 import { useStore } from "../store";
 import { computePeaks } from "../waveform";
 
@@ -41,8 +42,9 @@ export function Timeline() {
   const thumbsUrl = videoId && !isAudioOnly
     ? `/api/thumbnails/${videoId}?count=${THUMB_COUNT}&width=${THUMB_WIDTH}`
     : null;
+  const driver = audio.extras[0];
   const loopArmed = !!trimRange.loop;
-  const loopActive = loopArmed && audio.extraAudioId !== null && audio.extraAudioDuration > 0;
+  const loopActive = loopArmed && !!driver && driver.duration > 0;
 
   return (
     <div className="timeline" data-testid="timeline">
@@ -63,7 +65,7 @@ export function Timeline() {
         <span style={{ opacity: 0.4 }}>·</span>
         <span>{kept.toFixed(2)}s kept</span>
         <span style={{ opacity: 0.4 }}>·</span>
-        <label className="loop-toggle" data-testid="loop-toggle-label" title="Loop the selected slice across the extra audio's full duration (Coub mode)">
+        <label className="loop-toggle" data-testid="loop-toggle-label" title="Loop the selected slice across the first extra audio's full duration (Coub mode)">
           <input
             type="checkbox"
             data-testid="loop-toggle"
@@ -73,7 +75,7 @@ export function Timeline() {
           <span>Loop</span>
           {loopActive && (
             <span className="loop-target" data-testid="loop-target">
-              → {audio.extraAudioDuration.toFixed(1)}s
+              → {driver.duration.toFixed(1)}s
             </span>
           )}
           {loopArmed && !loopActive && (
@@ -82,7 +84,6 @@ export function Timeline() {
         </label>
       </div>
 
-      {/* tracks temporarily disabled for debugging */}
       <SourceTrack
         videoId={videoId}
         volume={audio.sourceVolume}
@@ -92,12 +93,17 @@ export function Timeline() {
         inSec={inSec}
         outSec={outSec}
       />
-      <ExtraTrack
-        audio={audio}
-        setAudio={setAudio}
-        setError={setError}
-        duration={duration}
-      />
+      {audio.extras.map((track, i) => (
+        <ExtraTrackRow
+          key={track.id}
+          track={track}
+          index={i}
+          isDriver={i === 0}
+          duration={duration}
+          setError={setError}
+        />
+      ))}
+      <AddExtraTrackButton setError={setError} />
     </div>
   );
 }
@@ -169,9 +175,6 @@ function TrimBar({
   const outPct = Math.max(0, Math.min(100, (outSec / duration) * 100));
   const ctPct = Math.max(0, Math.min(100, (currentTime / duration) * 100));
 
-  // Sprite sheet = one long JPG with `thumbCount` tiles across. To render it
-  // as a lane, we set background-size so the sprite's full width equals the
-  // bar's width × thumbCount / thumbCount → exactly stretched horizontally.
   const thumbStyle: React.CSSProperties = thumbsUrl
     ? {
         backgroundImage: `url(${thumbsUrl})`,
@@ -183,10 +186,7 @@ function TrimBar({
   return (
     <div className="trim-bar" data-testid="trim-bar" ref={rootRef}>
       <div className="trim-thumbs" style={thumbStyle} />
-      <div
-        className="trim-dim trim-dim-left"
-        style={{ width: `${inPct}%` }}
-      />
+      <div className="trim-dim trim-dim-left" style={{ width: `${inPct}%` }} />
       <div
         className="trim-dim trim-dim-right"
         style={{ left: `${outPct}%`, width: `${Math.max(0, 100 - outPct)}%` }}
@@ -256,95 +256,67 @@ function SourceTrack({
   );
 }
 
-// ---------- Extra track ----------
+// ---------- Extra track row (one per track) ----------
 
-function ExtraTrack({
-  audio,
-  setAudio,
-  setError,
+function ExtraTrackRow({
+  track,
+  isDriver,
   duration,
+  setError,
 }: {
-  audio: ReturnType<typeof useStore.getState>["audio"];
-  setAudio: (p: Partial<ReturnType<typeof useStore.getState>["audio"]>) => void;
-  setError: (msg: string | null) => void;
+  track: ExtraTrackData;
+  index: number;
+  isDriver: boolean;
   duration: number;
+  setError: (msg: string | null) => void;
 }) {
-  const [uploading, setUploading] = useState(false);
-  const inputRef = useRef<HTMLInputElement>(null);
-  const peakKey = audio.extraAudioId ? `extra:${audio.extraAudioId}` : null;
-  const extraBlobUrl = useExtraBlobUrl(audio.extraAudioId);
-  // Prefer server-computed peaks; fall back to client decode of the blob.
-  const extraServerPeaks = useServerExtraPeaks(audio.extraAudioId);
-  const decodedPeaks = useWaveform(peakKey, extraBlobUrl);
+  const peakKey = `extra:${track.id}`;
+  const blobUrl = useExtraBlobUrl(track.id);
+  const serverPeaks = useServerExtraPeaks(track.id);
+  const decodedPeaks = useWaveform(peakKey, blobUrl);
 
+  const setExtraTrack = useStore((s) => s.setExtraTrack);
+  const removeExtraTrack = useStore((s) => s.removeExtraTrack);
   const setExtraSegments = useStore((s) => s.setExtraSegments);
   const setSubtitleTrack = useStore((s) => s.setSubtitleTrack);
-  const setExtraSubsStreaming = useStore((s) => s.setExtraSubsStreaming);
+  const setExtraSubsStreamingId = useStore((s) => s.setExtraSubsStreamingId);
   const setProgress = useStore((s) => s.setProgress);
   const setJobId = useStore((s) => s.setJobId);
-  const extraSubsStreaming = useStore((s) => s.extraSubsStreaming);
+  const extraSubsStreamingId = useStore((s) => s.extraSubsStreamingId);
   const segmentsExtra = useStore((s) => s.segmentsExtra);
 
-  // After a project reload the store has the extra_audio_id but no name/
-  // duration (those weren't in meta.json). Rehydrate from /info so the
-  // waveform width and the toolbar duration display correctly.
+  const isStreaming = extraSubsStreamingId === track.id;
+  const someoneElseStreaming = extraSubsStreamingId !== null && !isStreaming;
+  const segs = segmentsExtra[track.id] ?? [];
+
+  // Rehydrate name/duration from /info on mount when missing (after reload).
   useEffect(() => {
-    const id = audio.extraAudioId;
-    if (!id) return;
-    if (audio.extraAudioDuration > 0 && audio.extraAudioName) return;
+    if (track.duration > 0 && track.name) return;
     let cancelled = false;
-    fetch(`/api/extra-audio/${encodeURIComponent(id)}/info`)
+    fetch(`/api/extra-audio/${encodeURIComponent(track.id)}/info`)
       .then((r) => (r.ok ? r.json() : null))
       .then((info) => {
         if (cancelled || !info) return;
-        setAudio({
-          extraAudioDuration: Number(info.duration) || 0,
-          extraAudioName: audio.extraAudioName ?? `extra.${info.ext ?? "audio"}`,
+        setExtraTrack(track.id, {
+          duration: Number(info.duration) || 0,
+          name: track.name ?? `extra.${info.ext ?? "audio"}`,
         });
       })
-      .catch(() => { /* network — skip silently, user will see stale 0s */ });
+      .catch(() => { /* */ });
     return () => { cancelled = true; };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [audio.extraAudioId]);
-
-  async function onFile(file: File) {
-    setUploading(true);
-    setError(null);
-    try {
-      const res = await uploadExtraAudio(file);
-      setExtraBlob(res.extra_audio_id, URL.createObjectURL(file));
-      setAudio({
-        extraAudioId: res.extra_audio_id,
-        extraAudioName: res.name,
-        extraAudioDuration: res.duration,
-      });
-      // Fresh extra audio invalidates any prior extra-track transcript.
-      setExtraSegments([]);
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
-    } finally {
-      setUploading(false);
-    }
-  }
+  }, [track.id]);
 
   function clear() {
-    if (audio.extraAudioId) clearExtraBlob(audio.extraAudioId);
-    setAudio({ extraAudioId: null, extraAudioName: null, extraAudioDuration: 0 });
-    setExtraSegments([]);
-    // If user was viewing extra-track captions, fall back to source.
-    if (useStore.getState().subtitleTrack === "extra") {
-      setSubtitleTrack("source");
-    }
+    clearExtraBlob(track.id);
+    removeExtraTrack(track.id);
+    setExtraSegments(track.id, []);
   }
 
   async function onTranscribeExtra() {
-    if (!audio.extraAudioId) return;
-    // Reset segments + flip the active track BEFORE we start so the live
-    // stream lands in front of the user immediately and the source-track
-    // tab doesn't appear to "lose" its segments mid-stream.
-    setExtraSegments([]);
-    setSubtitleTrack("extra");
-    setExtraSubsStreaming(true);
+    setExtraSegments(track.id, []);
+    setSubtitleTrack(track.id);
+    setExtraSubsStreamingId(track.id);
     setProgress("transcribe", 0);
     setError(null);
 
@@ -353,101 +325,65 @@ function ExtraTrack({
     let ws: WebSocket | null = null;
     try {
       ws = await openProgressWs(jobId);
-      // Fire the request — the WS is already listening for `extra_segment`
-      // events from the worker thread, so segments arrive in real time. The
-      // HTTP response is just the final summary.
-      const res = await transcribeExtra(audio.extraAudioId, {
-        language: "en",
-        jobId,
-      });
-      // Idempotent backstop: if the WS missed any tail events (network
-      // hiccup), the HTTP response carries the canonical segment list.
+      const res = await transcribeExtra(track.id, { language: "en", jobId });
       if (Array.isArray(res.segments) && res.segments.length > 0) {
-        useStore.getState().mergeExtraSegments(res.segments);
+        useStore.getState().mergeExtraSegments(track.id, res.segments);
       }
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
-      setExtraSubsStreaming(false);
+      setExtraSubsStreamingId(null);
       setProgress("idle", 0);
       setJobId(null);
     } finally {
-      // progress.ts closes the socket on extra_transcribe_done/cancelled/error;
-      // this is just defensive cleanup if the HTTP path errored before the WS
-      // got the terminal event.
-      if (!useStore.getState().extraSubsStreaming) {
+      if (useStore.getState().extraSubsStreamingId !== track.id) {
         try { ws?.close(); } catch { /* */ }
       }
     }
   }
 
-  async function onCancelExtraTranscribe() {
-    if (!audio.extraAudioId) return;
-    void cancelTranscribeExtra(audio.extraAudioId);
-    // Don't clear streaming flag here — wait for the server to push
-    // extra_transcribe_cancelled, which progress.ts handles. This way the
-    // strip stays visible until the worker actually stops.
+  function onCancelExtraTranscribe() {
+    void cancelTranscribeExtra(track.id);
+    // progress.ts clears extraSubsStreamingId on extra_transcribe_cancelled.
   }
 
-  if (!audio.extraAudioId) {
-    return (
-      <div className="track-row track-row-empty" data-testid="extra-track-empty">
-        <div className="track-label">Extra</div>
-        <button
-          type="button"
-          className="track-add"
-          data-testid="extra-track-add"
-          tabIndex={-1}
-          onMouseDown={(e) => e.preventDefault()}
-          onClick={() => inputRef.current?.click()}
-          disabled={uploading}
-        >
-          {uploading ? "Uploading…" : "+ Add audio track (mp3/wav/m4a/ogg/flac/aac)"}
-        </button>
-        <input
-          ref={inputRef}
-          type="file"
-          accept="audio/*,.mp3,.wav,.m4a,.ogg,.flac,.aac"
-          data-testid="extra-file-input"
-          style={{ display: "none" }}
-          onChange={(e) => {
-            const f = e.target.files?.[0];
-            if (f) onFile(f);
-            e.target.value = "";
-          }}
-        />
-      </div>
-    );
-  }
-
-  // Extra width is proportional to extraDuration / videoDuration. The
-  // waveform is drawn ONLY in that sub-region of the bar; the rest is rail.
-  const extraWidthPct = Math.min(100, (audio.extraAudioDuration / Math.max(0.01, duration)) * 100);
-  const hasExtraSubs = segmentsExtra.length > 0;
+  const widthPct = Math.min(100, (track.duration / Math.max(0.01, duration)) * 100);
+  const hasExtraSubs = segs.length > 0;
   return (
-    <div className="track-row" data-testid="extra-track">
+    <div className="track-row" data-testid={`extra-track-${track.id}`}>
       <div className="track-label">
-        <span className="track-label-text">Extra</span>
-        <VolumeSlider value={audio.extraVolume} onChange={(v) => setAudio({ extraVolume: v })} testId="extra-volume" />
+        <span className="track-label-text">
+          Extra
+          {isDriver && (
+            <span className="loop-driver-badge" data-testid={`loop-driver-badge-${track.id}`} title="Loop driver — its duration sets the looped output length">
+              ★
+            </span>
+          )}
+        </span>
+        <VolumeSlider
+          value={track.volume}
+          onChange={(v) => setExtraTrack(track.id, { volume: v })}
+          testId={`extra-volume-${track.id}`}
+        />
       </div>
       <div className="track-body">
         <WaveformBar
-          peaks={extraServerPeaks ?? decodedPeaks}
+          peaks={serverPeaks ?? decodedPeaks}
           variant="extra"
-          widthPct={extraWidthPct}
+          widthPct={widthPct}
           inPct={0}
           outPct={100}
           currentPct={null}
         />
-        <div className="track-extra-info" data-testid="extra-track-info">
-          <span className="track-extra-name" title={audio.extraAudioName ?? ""}>
-            🎵 {audio.extraAudioName ?? "extra"}
+        <div className="track-extra-info" data-testid={`extra-track-info-${track.id}`}>
+          <span className="track-extra-name" title={track.name ?? ""}>
+            🎵 {track.name ?? "extra"}
           </span>
-          <span className="track-extra-dur">{audio.extraAudioDuration.toFixed(1)}s</span>
-          {extraSubsStreaming ? (
+          <span className="track-extra-dur">{track.duration.toFixed(1)}s</span>
+          {isStreaming ? (
             <button
               type="button"
               className="extra-transcribe-button extra-transcribe-cancel"
-              data-testid="extra-transcribe-cancel"
+              data-testid={`extra-transcribe-cancel-${track.id}`}
               tabIndex={-1}
               onMouseDown={(e) => e.preventDefault()}
               onClick={onCancelExtraTranscribe}
@@ -459,11 +395,14 @@ function ExtraTrack({
             <button
               type="button"
               className="extra-transcribe-button"
-              data-testid="extra-transcribe-button"
+              data-testid={`extra-transcribe-button-${track.id}`}
               tabIndex={-1}
               onMouseDown={(e) => e.preventDefault()}
               onClick={onTranscribeExtra}
-              title="Run whisper on this audio track and add a separate subtitle track"
+              disabled={someoneElseStreaming}
+              title={someoneElseStreaming
+                ? "Another track is being transcribed — wait or cancel it"
+                : "Run whisper on this audio track and add a separate subtitle track"}
             >
               {hasExtraSubs ? "Re-generate subs" : "Generate subs"}
             </button>
@@ -471,16 +410,72 @@ function ExtraTrack({
           <button
             type="button"
             className="track-extra-remove"
-            data-testid="extra-track-remove"
+            data-testid={`extra-track-remove-${track.id}`}
             tabIndex={-1}
             onMouseDown={(e) => e.preventDefault()}
             onClick={clear}
-            title="Remove extra track"
+            title="Remove this track"
           >
             ×
           </button>
         </div>
       </div>
+    </div>
+  );
+}
+
+// ---------- "+ Add audio track" footer button ----------
+
+function AddExtraTrackButton({ setError }: { setError: (m: string | null) => void }) {
+  const [uploading, setUploading] = useState(false);
+  const inputRef = useRef<HTMLInputElement>(null);
+  const addExtraTrack = useStore((s) => s.addExtraTrack);
+
+  async function onFile(file: File) {
+    setUploading(true);
+    setError(null);
+    try {
+      const res = await uploadExtraAudio(file);
+      setExtraBlob(res.extra_audio_id, URL.createObjectURL(file));
+      addExtraTrack({
+        id: res.extra_audio_id,
+        name: res.name,
+        duration: res.duration,
+        volume: 1.0,
+      });
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setUploading(false);
+    }
+  }
+
+  return (
+    <div className="track-row track-row-empty" data-testid="extra-track-add-row">
+      <div className="track-label">Extra</div>
+      <button
+        type="button"
+        className="track-add"
+        data-testid="extra-track-add"
+        tabIndex={-1}
+        onMouseDown={(e) => e.preventDefault()}
+        onClick={() => inputRef.current?.click()}
+        disabled={uploading}
+      >
+        {uploading ? "Uploading…" : "+ Add audio track (mp3/wav/m4a/ogg/flac/aac)"}
+      </button>
+      <input
+        ref={inputRef}
+        type="file"
+        accept="audio/*,.mp3,.wav,.m4a,.ogg,.flac,.aac"
+        data-testid="extra-file-input"
+        style={{ display: "none" }}
+        onChange={(e) => {
+          const f = e.target.files?.[0];
+          if (f) onFile(f);
+          e.target.value = "";
+        }}
+      />
     </div>
   );
 }
@@ -524,11 +519,8 @@ function WaveformBar({
   variant,
 }: {
   peaks: Float32Array | null;
-  /** % of the wave-wrap width that the peaks actually occupy (rest is rail). */
   widthPct: number;
-  /** Trim-in dim overlay position, in % of wave-wrap width. */
   inPct: number;
-  /** Trim-out dim overlay position, in % of wave-wrap width. */
   outPct: number;
   currentPct: number | null;
   variant?: "source" | "extra";
@@ -553,11 +545,9 @@ function WaveformBar({
       ctx.scale(dpr, dpr);
       ctx.clearRect(0, 0, wFull, h);
       const mid = h / 2;
-      // Rail across full width (so empty audio still reads as a track).
       ctx.fillStyle = "rgba(255, 255, 255, 0.08)";
       ctx.fillRect(0, mid - 1, wFull, 2);
 
-      // Peaks occupy only widthPct % of the bar — the rest stays as rail.
       const drawW = Math.max(0, Math.min(wFull, (wFull * widthPct) / 100));
       if (peaks && peaks.length > 0 && drawW > 0) {
         const fill = variant === "extra" ? "rgba(255, 196, 0, 0.85)" : "rgba(124, 92, 255, 0.85)";
@@ -579,10 +569,7 @@ function WaveformBar({
   return (
     <div className="wave-wrap">
       <canvas ref={canvasRef} className="wave-canvas" />
-      <div
-        className="wave-dim wave-dim-left"
-        style={{ width: `${Math.max(0, inPct)}%` }}
-      />
+      <div className="wave-dim wave-dim-left" style={{ width: `${Math.max(0, inPct)}%` }} />
       <div
         className="wave-dim wave-dim-right"
         style={{ left: `${outPct}%`, width: `${Math.max(0, 100 - outPct)}%` }}
@@ -625,8 +612,6 @@ function useWaveform(key: string | null, url: string | null): Float32Array | nul
 function useExtraBlobUrl(extraId: string | null): string | null {
   return getExtraBlob(extraId);
 }
-
-// --- server peaks (backend ffmpeg-computed, cheap) ---
 
 const serverPeaksCache = new Map<string, Float32Array | null>();
 

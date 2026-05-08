@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import {
   attachAudioMix,
   getAudioMix,
@@ -28,22 +28,23 @@ export function VideoPreview() {
   const watermark = useStore((s) => s.watermark);
   const trimRange = useStore((s) => s.trimRange);
   const sourceVolume = useStore((s) => s.audio.sourceVolume);
-  const extraAudioId = useStore((s) => s.audio.extraAudioId);
-  const extraAudioDuration = useStore((s) => s.audio.extraAudioDuration);
-  const extraVolume = useStore((s) => s.audio.extraVolume);
+  const extras = useStore((s) => s.audio.extras);
   const duration = useStore((s) => s.duration);
   const videoRef = useRef<HTMLVideoElement>(null);
   const stageRef = useRef<HTMLDivElement>(null);
   const [scale, setScale] = useState(1);
 
+  // Loop driver = first extra. Its duration sets the master timeline.
+  const driver = extras[0];
   const trimOut = trimRange.out_sec > 0 ? trimRange.out_sec : duration;
   const loopClipDuration = Math.max(0, trimOut - trimRange.in_sec);
-  const loopActive = !!trimRange.loop && extraAudioId !== null && extraAudioDuration > 0 && loopClipDuration > 0;
+  const loopActive =
+    !!trimRange.loop &&
+    !!driver &&
+    driver.duration > 0 &&
+    loopClipDuration > 0;
 
   const resolved = resolveCanvas(canvas, videoW, videoH, false);
-  // In custom mode the preview-frame renders the FULL source (so the user can
-  // drag/resize a crop rect over it). targetW/H reported by resolveCanvas in
-  // custom mode is the crop dims — not what we want for the preview frame.
   const frameW = canvas.mode === "custom" ? (videoW || resolved.targetW) : resolved.targetW;
   const frameH = canvas.mode === "custom" ? (videoH || resolved.targetH) : resolved.targetH;
 
@@ -69,21 +70,36 @@ export function VideoPreview() {
     return () => setVideoEl(null);
   }, [videoUrl, setVideoEl]);
 
-  // Build / rebuild the WebAudio mix graph when the <video> element or the
-  // chosen extra audio track changes. The video's own `volume` property is
-  // bypassed once WebAudio takes over the element (it routes through the
-  // GainNode instead), so we set gains via setSourceVolume/setExtraVolume.
+  // Build / rebuild the WebAudio mix graph when the <video> element or
+  // the set of extra tracks changes (add/remove/reorder/url change).
+  // `attachAudioMix` reconciles incrementally — already-attached tracks
+  // stay connected, only deltas change.
+  const extrasResolved = useMemo(
+    () => extras
+      .map((e) => {
+        const url = getExtraAudioPlaybackUrl(e.id);
+        return url ? { id: e.id, url, volume: e.volume } : null;
+      })
+      .filter((x): x is { id: string; url: string; volume: number } => x !== null),
+    [extras],
+  );
+  const extrasResolvedKey = extrasResolved.map((e) => `${e.id}|${e.url}`).join(";");
+
   useEffect(() => {
     const v = videoRef.current;
     if (!v || !videoUrl) return;
-    const extraUrl = getExtraAudioPlaybackUrl(extraAudioId);
-    const mix = attachAudioMix(v, extraUrl);
+    const mix = attachAudioMix(v, extrasResolved);
     mix.srcGain.gain.value = Math.max(0, Math.min(2, sourceVolume));
-    mix.extraGain.gain.value = Math.max(0, Math.min(2, extraVolume));
-  }, [videoUrl, extraAudioId]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [videoUrl, extrasResolvedKey]);
 
   useEffect(() => { setSourceVolume(sourceVolume); }, [sourceVolume]);
-  useEffect(() => { setExtraVolume(extraVolume); }, [extraVolume]);
+  // Push every track's individual volume on each change.
+  useEffect(() => {
+    for (const e of extras) {
+      setExtraVolume(e.id, e.volume);
+    }
+  }, [extras]);
 
   useEffect(() => {
     const v = videoRef.current;
@@ -124,30 +140,33 @@ export function VideoPreview() {
     };
   }, [setCurrentTime, videoUrl, trimRange.in_sec, trimRange.out_sec, loopActive]);
 
-  // Loop-mode preview: extra audio drives the master clock, the video is
-  // re-seeked every animation frame to `trimIn + (master % loopClipDur)` so
-  // the chosen slice plays on repeat under the soundtrack.
+  // Loop-mode preview: the driver track (extras[0]) is the master clock.
+  // The video is reseated every animation frame to
+  // `trimIn + (driverTime % loopClipDur)`. Every other extra rides the
+  // driver clock too (handled inside `syncVideoToLoopedExtra`).
   useEffect(() => {
-    if (!loopActive) return;
+    if (!loopActive || !driver) return;
     const v = videoRef.current;
     if (!v) return;
     const mix = getAudioMix();
-    if (!mix?.extraEl) return;
-    const extra = mix.extraEl;
+    if (!mix?.extras.get(driver.id)) return;
+    const driverEl = mix.extras.get(driver.id)!.el;
     let raf = 0;
     let alive = true;
 
     const tick = () => {
       if (!alive) return;
-      const r = syncVideoToLoopedExtra(v, trimRange.in_sec, loopClipDuration);
+      const r = syncVideoToLoopedExtra(v, trimRange.in_sec, loopClipDuration, driver.id);
       if (r) {
         setCurrentTime(r.master);
-        if (extraAudioDuration > 0 && r.master >= extraAudioDuration - 0.02) {
-          // End of soundtrack — stop both elements; user can hit play to
-          // restart from 0.
+        if (driver.duration > 0 && r.master >= driver.duration - 0.02) {
+          // Reached the end of the soundtrack — stop everything; play
+          // restarts from 0 next time.
           if (!v.paused) v.pause();
-          if (!extra.paused) extra.pause();
-          try { extra.currentTime = 0; } catch { /* */ }
+          for (const node of mix.extras.values()) {
+            if (!node.el.paused) node.el.pause();
+          }
+          try { driverEl.currentTime = 0; } catch { /* */ }
           return;
         }
       }
@@ -156,23 +175,19 @@ export function VideoPreview() {
 
     const onPlay = () => {
       resumeAudioContext();
-      // Bring video into phase BEFORE the first frame of audio so the
-      // initial second isn't a glitch from the previous trim_out position.
-      const r = syncVideoToLoopedExtra(v, trimRange.in_sec, loopClipDuration);
+      const r = syncVideoToLoopedExtra(v, trimRange.in_sec, loopClipDuration, driver.id);
       if (r) setCurrentTime(r.master);
       cancelAnimationFrame(raf);
       raf = requestAnimationFrame(tick);
     };
     const onPause = () => {
-      if (!extra.paused) extra.pause();
+      for (const node of mix.extras.values()) {
+        if (!node.el.paused) node.el.pause();
+      }
       cancelAnimationFrame(raf);
     };
-    // Treat seek on the video element (e.g. from external code) as a seek
-    // on the master — but in this mode the toolbar seeks the extra element
-    // directly, so this is mostly for safety.
     v.addEventListener("play", onPlay);
     v.addEventListener("pause", onPause);
-    // Kick the loop once so the video is in phase as soon as loop activates.
     raf = requestAnimationFrame(tick);
     return () => {
       alive = false;
@@ -181,8 +196,9 @@ export function VideoPreview() {
       v.removeEventListener("pause", onPause);
     };
   }, [
-    loopActive, trimRange.in_sec, loopClipDuration, extraAudioDuration,
-    setCurrentTime, videoUrl, extraAudioId,
+    loopActive, driver?.id, driver?.duration,
+    trimRange.in_sec, loopClipDuration,
+    setCurrentTime, videoUrl,
   ]);
 
   if (!videoUrl) return null;

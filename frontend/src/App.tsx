@@ -116,7 +116,7 @@ export function App() {
     let alreadyWarned = false;
     const id = setInterval(() => {
       const s = useStore.getState();
-      const streaming = s.subsStreaming || s.extraSubsStreaming;
+      const streaming = s.subsStreaming || s.extraSubsStreamingId !== null;
       if (!streaming) {
         alreadyWarned = false;
         return;

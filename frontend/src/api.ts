@@ -15,12 +15,18 @@ export type ProjectStatePayload = {
   size?: Size;
   canvas?: CanvasConfig;
   trim_range?: TrimRange;
-  audio?: { source_volume: number; extra_audio_id: string | null; extra_volume: number };
+  audio?: {
+    source_volume: number;
+    extras?: Array<{ id: string; volume: number; name?: string | null; duration?: number }>;
+    // Legacy single-track fields (still accepted by older saves):
+    extra_audio_id?: string | null;
+    extra_volume?: number;
+  };
   use_subs?: boolean;
   display_mode?: DisplayMode;
   updated_at?: number;
-  extra_segments?: Segment[];
-  subtitle_track?: "source" | "extra";
+  extra_segments?: Record<string, Segment[]> | Segment[];
+  subtitle_track?: string;
 };
 
 const API_BASE = "";
@@ -164,7 +170,8 @@ export async function exportVideo(args: {
   format?: ExportFormat;
   gifQuality?: GifQuality;
   watermark?: boolean;
-  subtitleTrack?: "source" | "extra";
+  /** "source" or any extra_audio_id present in audio.extras. */
+  subtitleTrack?: string;
 }): Promise<ExportResponse> {
   const url = args.jobId
     ? `${API_BASE}/api/export?job_id=${encodeURIComponent(args.jobId)}`
@@ -191,8 +198,10 @@ export async function exportVideo(args: {
       },
       audio: {
         source_volume: audio?.sourceVolume ?? 1.0,
-        extra_audio_id: audio?.extraAudioId ?? null,
-        extra_volume: audio?.extraVolume ?? 1.0,
+        extras: (audio?.extras ?? []).map((e) => ({
+          id: e.id,
+          volume: e.volume,
+        })),
       },
       format: args.format ?? "mp4",
       gif_quality: args.gifQuality ?? "medium",

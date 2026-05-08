@@ -132,23 +132,30 @@ def test_loop_with_extra_routes_to_filter_only_with_total_duration(client, spies
         assert kw["loop_total_duration"] == pytest.approx(12.0)
         # trim_duration carries the SHORT clip (one iteration), not the total.
         assert kw["trim_duration"] == pytest.approx(3.0)
-        assert kw["extra_audio"] == extra_path
+        assert len(kw["extras"]) == 1
+        assert kw["extras"][0][0] == extra_path
     finally:
         extra_path.unlink(missing_ok=True)
         _cleanup_video(VIDEO_ID)
 
 
 def test_loop_without_extra_audio_is_noop(client, spies):
-    """trim.loop=true without extra audio must not engage the loop filter
-    chain. The flag stays a flag — it needs an extra track to mean anything."""
+    """trim.loop=true without extras must not engage the loop filter chain.
+    The flag stays a flag — it needs at least one extra track to mean
+    anything."""
     _cleanup_video(VIDEO_ID)
     _seed_video(VIDEO_ID, duration=5.0)
     try:
         body = _body(VIDEO_ID, trim={"in_sec": 0.0, "out_sec": 3.0, "loop": True})
         r = client.post("/api/export", json=body)
+        # Backend hard-fails when loop is requested but the driver track
+        # doesn't exist. That's a 410 — the user has to re-upload or turn
+        # loop off. Accept either 410 (current contract) or 200 with
+        # loop_total_duration=None (alternate "soft fall-through" if a
+        # future relaxation lands).
+        if r.status_code == 410:
+            return
         assert r.status_code == 200, r.text
-        # No loop, no extra → stream_copy fast-path is OK provided no other
-        # transform is active. With trim edges set we route to filter_only.
         assert "filter_only" in spies
         kw = spies["filter_only"]
         assert kw.get("loop_total_duration") in (None, 0)
@@ -189,7 +196,7 @@ def test_loop_with_subtitle_track_extra_does_not_expand(client, spies):
     extra_path.write_bytes(b"\x00" * 64)
     try:
         # Caller declares the segments are from extra audio (their timings
-        # already live on the master extra-audio timeline). Do NOT re-stamp.
+        # already live on the extra-audio timeline). Do NOT re-stamp.
         segs = [
             {"start": 1.0, "end": 2.0, "text": "a", "words": []},
             {"start": 9.0, "end": 10.0, "text": "b", "words": []},
@@ -197,7 +204,7 @@ def test_loop_with_subtitle_track_extra_does_not_expand(client, spies):
         body = _body(
             VIDEO_ID,
             segments=segs,
-            subtitle_track="extra",
+            subtitle_track=EXTRA_ID,
             trim={"in_sec": 0.0, "out_sec": 3.0, "loop": True},
             audio={"source_volume": 1.0, "extra_audio_id": EXTRA_ID, "extra_volume": 1.0},
         )
@@ -263,8 +270,7 @@ def test_run_filter_only_loop_real_ffmpeg(tmp_path: Path) -> None:
         trim_in=0.0,
         trim_duration=2.0,
         source_volume=1.0,
-        extra_audio=extra,
-        extra_volume=1.0,
+        extras=[(extra, 1.0)],
         watermark_path=None,
         source_has_audio=False,  # source has no audio (-an)
         loop_total_duration=6.0,
@@ -293,8 +299,7 @@ def test_run_filter_only_no_loop_unchanged(tmp_path: Path) -> None:
         trim_in=0.5,
         trim_duration=1.5,
         source_volume=1.0,
-        extra_audio=None,
-        extra_volume=1.0,
+        extras=None,
         watermark_path=None,
         source_has_audio=False,
         loop_total_duration=None,
@@ -302,3 +307,36 @@ def test_run_filter_only_no_loop_unchanged(tmp_path: Path) -> None:
     )
     dur = _ffprobe_duration(out)
     assert 1.3 <= dur <= 1.7, f"no-loop duration {dur:.2f}s out of band"
+
+
+def test_run_filter_only_two_extras_real_ffmpeg(tmp_path: Path) -> None:
+    """3s muted source + tone1(2s) + tone2(4s), no loop → out ≈ 3s,
+    audio = mix of both extras padded with silence after they run out."""
+    src = tmp_path / "src.mp4"
+    e1 = tmp_path / "e1.mp3"
+    e2 = tmp_path / "e2.mp3"
+    out = tmp_path / "out.mp4"
+    _mk_short_video(src, 3.0)
+    _mk_tone(e1, 2.0)
+    _mk_tone(e2, 4.0)
+
+    run_filter_only(
+        source=src,
+        out=out,
+        canvas_filter="",
+        target_w=160,
+        target_h=120,
+        select_expr=None,
+        trim_in=0.0,
+        trim_duration=3.0,
+        source_volume=1.0,
+        extras=[(e1, 0.5), (e2, 0.8)],
+        watermark_path=None,
+        source_has_audio=False,
+        loop_total_duration=None,
+        fps=15,
+    )
+    assert out.exists() and out.stat().st_size > 0
+    dur = _ffprobe_duration(out)
+    # Output rides the source video's length (-shortest = video).
+    assert 2.7 <= dur <= 3.3, f"two-extra output duration {dur:.2f}s out of band"

@@ -17,18 +17,25 @@ export function PreviewToolbar() {
   const duration = useStore((s) => s.duration);
   const currentTime = useStore((s) => s.currentTime);
   const trimRange = useStore((s) => s.trimRange);
-  const extraAudioId = useStore((s) => s.audio.extraAudioId);
-  const extraAudioDuration = useStore((s) => s.audio.extraAudioDuration);
+  const extras = useStore((s) => s.audio.extras);
   const [playing, setPlaying] = useState(false);
+
+  // Loop driver = first extra. Its duration sets the master timeline.
+  const driver = extras[0];
+  const driverDuration = driver?.duration ?? 0;
 
   const trimIn = Math.max(0, trimRange.in_sec);
   const trimOut = trimRange.out_sec > 0 ? Math.min(trimRange.out_sec, duration || 0) : (duration || 0);
   const loopClipDuration = Math.max(0, trimOut - trimIn);
-  const loopActive = !!trimRange.loop && extraAudioId !== null && extraAudioDuration > 0 && loopClipDuration > 0;
-  // In loop mode the master timeline is the extra audio (0 .. extraDur);
-  // currentTime already mirrors extra.currentTime via the rAF loop.
+  const loopActive =
+    !!trimRange.loop &&
+    !!driver &&
+    driverDuration > 0 &&
+    loopClipDuration > 0;
+  // In loop mode the master timeline is the driver track (0 .. driverDur);
+  // currentTime already mirrors driver.currentTime via the rAF loop.
   const effectiveDuration = loopActive
-    ? Math.max(0.01, extraAudioDuration)
+    ? Math.max(0.01, driverDuration)
     : Math.max(0.01, trimOut - trimIn);
   const progressVal = loopActive
     ? Math.max(0, Math.min(effectiveDuration, currentTime))
@@ -63,9 +70,9 @@ export function PreviewToolbar() {
     const v = videoEl;
     if (!v) return;
     v.pause();
-    if (loopActive) {
-      const extra = getAudioMix()?.extraEl;
-      if (extra) try { extra.currentTime = 0; } catch { /* */ }
+    if (loopActive && driver) {
+      const driverEl = getAudioMix()?.extras.get(driver.id)?.el;
+      if (driverEl) try { driverEl.currentTime = 0; } catch { /* */ }
       v.currentTime = trimIn;
       return;
     }
@@ -76,11 +83,11 @@ export function PreviewToolbar() {
     const v = videoEl;
     if (!v) return;
     const rel = Number(e.target.value);
-    if (loopActive) {
-      const extra = getAudioMix()?.extraEl;
-      if (extra) {
-        const m = Math.max(0, Math.min(extraAudioDuration, rel));
-        try { extra.currentTime = m; } catch { /* */ }
+    if (loopActive && driver) {
+      const driverEl = getAudioMix()?.extras.get(driver.id)?.el;
+      if (driverEl) {
+        const m = Math.max(0, Math.min(driverDuration, rel));
+        try { driverEl.currentTime = m; } catch { /* */ }
         // Re-seat video into phase immediately for visual responsiveness.
         const phase = loopClipDuration > 0 ? (m % loopClipDuration) : 0;
         try { v.currentTime = trimIn + phase; } catch { /* */ }
@@ -136,9 +143,9 @@ export function PreviewToolbar() {
         aria-label="Seek"
       />
       <span className="player-time" data-testid="player-time">
-        {fmt(loopActive ? currentTime : currentTime)}{" "}
+        {fmt(currentTime)}{" "}
         <span className="player-time-sep">/</span>{" "}
-        {fmt(loopActive ? extraAudioDuration : duration)}
+        {fmt(loopActive ? driverDuration : duration)}
       </span>
     </div>
   );

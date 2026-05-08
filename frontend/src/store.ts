@@ -79,19 +79,27 @@ export type CanvasConfig = {
  * duration in both preview and export. */
 export type TrimRange = { in_sec: number; out_sec: number; loop: boolean };
 
-/** Original + optional extra audio track mixed into export. */
+/** A single extra audio track. Multiple can stack under the source video,
+ * each with its own volume and (optionally) its own subtitle transcript. */
+export type ExtraTrack = {
+  id: string;
+  name: string | null;
+  duration: number;
+  volume: number;            // 0.0..2.0
+};
+
+/** Source-video audio + ordered list of extra tracks. The first entry of
+ * `extras`, when present, is the loop driver (its duration sets total
+ * length in Coub mode). */
 export type AudioConfig = {
   sourceVolume: number;        // 0.0..2.0, default 1.0
-  extraAudioId: string | null;
-  extraAudioName: string | null;
-  extraAudioDuration: number;
-  extraVolume: number;         // 0.0..2.0, default 1.0
+  extras: ExtraTrack[];
 };
 
 /** Which transcript drives the on-screen captions and the burned subtitles
- * at export. "source" = whisper on the original video; "extra" = whisper on
- * the uploaded extra audio (Coub mode). */
-export type SubtitleTrack = "source" | "extra";
+ * at export. "source" = whisper on the original video; otherwise an
+ * extra-audio id present in `audio.extras`. */
+export type SubtitleTrack = string;
 
 type State = {
   videoId: string | null;
@@ -99,20 +107,21 @@ type State = {
   duration: number;
   videoW: number;
   videoH: number;
-  /** Active transcript — alias of segmentsSource or segmentsExtra depending
-   * on `subtitleTrack`. Kept on the top level so existing code that reads
-   * `s.segments` still finds the right data without refactor. */
+  /** Active transcript — mirrored from `segmentsSource` or
+   * `segmentsExtra[subtitleTrack]` so that legacy components reading
+   * `s.segments` keep working without a manual selector. */
   segments: Segment[];
   /** Whisper-on-source-video transcript. Filled by the upload flow. */
   segmentsSource: Segment[];
-  /** Whisper-on-extra-audio transcript. Filled by the explicit Generate-subs
-   * button on the extra track. */
-  segmentsExtra: Segment[];
-  /** Which transcript is active in the editor (and used for export). */
+  /** Per-track whisper transcripts, keyed by extra_audio_id. Each entry is
+   * filled by the explicit Generate-subs button on that track. */
+  segmentsExtra: Record<string, Segment[]>;
+  /** Which transcript is active in the editor (and used for export):
+   * "source" or any id in `audio.extras`. */
   subtitleTrack: SubtitleTrack;
-  /** True while transcribe-extra is streaming. Mirrors `subsStreaming` for
-   * the extra-track path. */
-  extraSubsStreaming: boolean;
+  /** Id of the extra track currently being transcribed via /api/transcribe-extra
+   * (only one runs at a time on the backend; new requests preempt). */
+  extraSubsStreamingId: string | null;
   style: Style;
   position: Position;
   size: Size;
@@ -164,19 +173,35 @@ type Actions = {
       size?: Size;
       canvas?: CanvasConfig;
       trim_range?: TrimRange;
-      audio?: { source_volume: number; extra_audio_id: string | null; extra_volume: number };
+      audio?: {
+        source_volume: number;
+        // Multi-track form (preferred):
+        extras?: Array<{ id: string; volume: number; name?: string | null; duration?: number }>;
+        // Legacy single-track form (still accepted on read):
+        extra_audio_id?: string | null;
+        extra_volume?: number;
+      };
       use_subs?: boolean;
       display_mode?: DisplayMode;
-      extra_segments?: Segment[];
+      extra_segments?: Segment[] | Record<string, Segment[]>;
       subtitle_track?: SubtitleTrack;
     } | null;
   }) => void;
   setLoop: (v: boolean) => void;
   setSubtitleTrack: (track: SubtitleTrack) => void;
-  setExtraSegments: (segs: Segment[]) => void;
-  setExtraSubsStreaming: (v: boolean) => void;
-  appendExtraSegment: (seg: Segment, index: number) => void;
-  mergeExtraSegments: (segs: Segment[]) => void;
+  /** Add a new extra track (append to the end of audio.extras). */
+  addExtraTrack: (track: ExtraTrack) => void;
+  /** Patch a single track by id (e.g. update volume, name, duration). */
+  setExtraTrack: (id: string, patch: Partial<ExtraTrack>) => void;
+  /** Remove a track by id. Cleans up its segments and falls back to
+   * "source" if the active subtitle track was this one. Disables loop if
+   * the removed track was the loop driver (extras[0]). */
+  removeExtraTrack: (id: string) => void;
+  /** Replace per-track segments for one extra. */
+  setExtraSegments: (id: string, segs: Segment[]) => void;
+  setExtraSubsStreamingId: (id: string | null) => void;
+  appendExtraSegment: (id: string, seg: Segment, index: number) => void;
+  mergeExtraSegments: (id: string, segs: Segment[]) => void;
   setStyle: (patch: Partial<Style>) => void;
   setPosition: (p: Position) => void;
   setSize: (s: Size) => void;
@@ -241,9 +266,9 @@ export const useStore = create<State & Actions>()(
       videoH: 0,
       segments: [],
       segmentsSource: [],
-      segmentsExtra: [],
+      segmentsExtra: {},
       subtitleTrack: "source" as SubtitleTrack,
-      extraSubsStreaming: false,
+      extraSubsStreamingId: null,
       style: { ...defaultStyle },
       position: { x_pct: 10, y_pct: 80 },
       size: { w_pct: 80, h_pct: 15 },
@@ -257,10 +282,7 @@ export const useStore = create<State & Actions>()(
       trimRange: { in_sec: 0, out_sec: 0, loop: false },
       audio: {
         sourceVolume: 1.0,
-        extraAudioId: null,
-        extraAudioName: null,
-        extraAudioDuration: 0,
-        extraVolume: 1.0,
+        extras: [],
       },
       canvas: {
         mode: "preset",
@@ -286,9 +308,9 @@ export const useStore = create<State & Actions>()(
             videoH: r.height,
             segments: r.segments,  // may be empty initially — bg stream fills via appendSegment
             segmentsSource: r.segments,
-            segmentsExtra: [],
+            segmentsExtra: {},
             subtitleTrack: "source" as SubtitleTrack,
-            extraSubsStreaming: false,
+            extraSubsStreamingId: null,
             busy: "idle",
             error: null,
             isAudioOnly: isAudio,
@@ -296,10 +318,7 @@ export const useStore = create<State & Actions>()(
             trimRange: { in_sec: 0, out_sec: 0, loop: false },
             audio: {
               sourceVolume: 1.0,
-              extraAudioId: null,
-              extraAudioName: null,
-              extraAudioDuration: 0,
-              extraVolume: 1.0,
+              extras: [],
             },
             canvas: isAudio && s.canvas.preset === "source"
               ? { ...s.canvas, preset: "9:16", bg_color: s.canvas.bg_color === "#000000" ? "#00B140" : s.canvas.bg_color }
@@ -309,9 +328,57 @@ export const useStore = create<State & Actions>()(
       loadProject: (r) => set((s) => {
         const isAudio = !!r.is_audio_only || (r.width === 0 && r.height === 0);
         const p = r.project ?? null;
-        const extraSegs = p?.extra_segments ?? [];
-        const track: SubtitleTrack = p?.subtitle_track ?? "source";
-        const activeSegs = track === "extra" ? extraSegs : r.segments;
+
+        // Resolve audio.extras from new form (preferred) or legacy form
+        // (one-element fallback). Names/durations are best-effort —
+        // hydrated later from /api/extra-audio/{id}/info on mount.
+        let extras: ExtraTrack[] = [];
+        let sourceVolume = 1.0;
+        if (p?.audio) {
+          sourceVolume = p.audio.source_volume ?? 1.0;
+          if (Array.isArray(p.audio.extras) && p.audio.extras.length > 0) {
+            extras = p.audio.extras.map((e) => ({
+              id: e.id,
+              name: e.name ?? null,
+              duration: typeof e.duration === "number" ? e.duration : 0,
+              volume: typeof e.volume === "number" ? e.volume : 1.0,
+            }));
+          } else if (p.audio.extra_audio_id) {
+            extras = [{
+              id: p.audio.extra_audio_id,
+              name: null,
+              duration: 0,
+              volume: typeof p.audio.extra_volume === "number" ? p.audio.extra_volume : 1.0,
+            }];
+          }
+        }
+
+        // Resolve segmentsExtra (Record). Old projects stored a flat list
+        // for the single extra track; promote to {id: list}.
+        let segmentsExtra: Record<string, Segment[]> = {};
+        const rawExtraSegs = p?.extra_segments;
+        if (Array.isArray(rawExtraSegs)) {
+          if (extras.length > 0) {
+            segmentsExtra = { [extras[0].id]: rawExtraSegs };
+          }
+        } else if (rawExtraSegs && typeof rawExtraSegs === "object") {
+          segmentsExtra = rawExtraSegs as Record<string, Segment[]>;
+        }
+
+        // Subtitle track: "source", or one of extras[].id. Legacy "extra"
+        // string maps to the first extra (if any), else "source".
+        let track: SubtitleTrack = p?.subtitle_track ?? "source";
+        if (track === "extra") {
+          track = extras.length > 0 ? extras[0].id : "source";
+        }
+        if (track !== "source" && !extras.find((e) => e.id === track)) {
+          track = "source";
+        }
+
+        const activeSegs = track === "source"
+          ? r.segments
+          : segmentsExtra[track] ?? [];
+
         return {
           videoId: r.video_id,
           videoUrl: r.url,
@@ -320,9 +387,9 @@ export const useStore = create<State & Actions>()(
           videoH: r.height,
           segments: activeSegs,
           segmentsSource: r.segments,
-          segmentsExtra: extraSegs,
+          segmentsExtra,
           subtitleTrack: track,
-          extraSubsStreaming: false,
+          extraSubsStreamingId: null,
           busy: "idle",
           error: null,
           isAudioOnly: isAudio,
@@ -336,21 +403,7 @@ export const useStore = create<State & Actions>()(
           trimRange: p?.trim_range
             ? { in_sec: p.trim_range.in_sec, out_sec: p.trim_range.out_sec, loop: !!p.trim_range.loop }
             : { in_sec: 0, out_sec: 0, loop: false },
-          audio: p?.audio
-            ? {
-                sourceVolume: p.audio.source_volume,
-                extraAudioId: p.audio.extra_audio_id,
-                extraAudioName: null,
-                extraAudioDuration: 0,
-                extraVolume: p.audio.extra_volume,
-              }
-            : {
-                sourceVolume: 1.0,
-                extraAudioId: null,
-                extraAudioName: null,
-                extraAudioDuration: 0,
-                extraVolume: 1.0,
-              },
+          audio: { sourceVolume, extras },
           useSubs: p?.use_subs ?? s.useSubs,
         };
       }),
@@ -362,35 +415,87 @@ export const useStore = create<State & Actions>()(
         subtitleTrack: track,
         // Mirror the active store-level alias so existing readers (overlay,
         // segment list) update without further plumbing.
-        segments: track === "extra" ? s.segmentsExtra : s.segmentsSource,
+        segments: track === "source"
+          ? s.segmentsSource
+          : (s.segmentsExtra[track] ?? []),
       })),
-      setExtraSegments: (segs) => set((s) => ({
-        segmentsExtra: segs,
-        segments: s.subtitleTrack === "extra" ? segs : s.segments,
+      addExtraTrack: (track) => set((s) => ({
+        audio: { ...s.audio, extras: [...s.audio.extras, track] },
+        // New track has no segments yet — initialise an empty list so the
+        // UI tab is enabled the moment whisper streams the first segment.
+        segmentsExtra: { ...s.segmentsExtra, [track.id]: s.segmentsExtra[track.id] ?? [] },
       })),
-      setExtraSubsStreaming: (v) => set({ extraSubsStreaming: v }),
-      appendExtraSegment: (seg, index) => set((s) => {
-        const next = [...s.segmentsExtra];
+      setExtraTrack: (id, patch) => set((s) => ({
+        audio: {
+          ...s.audio,
+          extras: s.audio.extras.map((t) => (t.id === id ? { ...t, ...patch } : t)),
+        },
+      })),
+      removeExtraTrack: (id) => set((s) => {
+        const wasDriver = s.audio.extras[0]?.id === id;
+        const remaining = s.audio.extras.filter((t) => t.id !== id);
+        const remainingSegs = { ...s.segmentsExtra };
+        delete remainingSegs[id];
+        // If the deleted track was active in the editor, fall back to source.
+        let nextTrack: SubtitleTrack = s.subtitleTrack;
+        let nextSegs: Segment[] = s.segments;
+        if (s.subtitleTrack === id) {
+          nextTrack = "source";
+          nextSegs = s.segmentsSource;
+        }
+        // If we just removed the loop driver and loop was on, disable loop
+        // — without a driver track its duration has nothing to anchor to.
+        const trimRange =
+          s.trimRange.loop && wasDriver
+            ? { ...s.trimRange, loop: false }
+            : s.trimRange;
+        return {
+          audio: { ...s.audio, extras: remaining },
+          segmentsExtra: remainingSegs,
+          subtitleTrack: nextTrack,
+          segments: nextSegs,
+          trimRange,
+          // Cancel any in-flight transcribe that targeted this id.
+          extraSubsStreamingId:
+            s.extraSubsStreamingId === id ? null : s.extraSubsStreamingId,
+        };
+      }),
+      setExtraSegments: (id, segs) => set((s) => {
+        const nextMap = { ...s.segmentsExtra, [id]: segs };
+        return {
+          segmentsExtra: nextMap,
+          segments: s.subtitleTrack === id ? segs : s.segments,
+        };
+      }),
+      setExtraSubsStreamingId: (id) => set({ extraSubsStreamingId: id }),
+      appendExtraSegment: (id, seg, index) => set((s) => {
+        const prev = s.segmentsExtra[id] ?? [];
+        const next = [...prev];
         next[index] = seg;
         for (let i = 0; i < next.length; i++) {
           if (next[i] === undefined) {
             next[i] = { start: 0, end: 0, text: "…", words: [] };
           }
         }
-        return s.subtitleTrack === "extra"
-          ? { segments: next, segmentsExtra: next }
-          : { segmentsExtra: next };
+        const nextMap = { ...s.segmentsExtra, [id]: next };
+        return {
+          segmentsExtra: nextMap,
+          segments: s.subtitleTrack === id ? next : s.segments,
+        };
       }),
-      mergeExtraSegments: (incoming) => set((s) => {
-        const next = [...s.segmentsExtra];
+      mergeExtraSegments: (id, incoming) => set((s) => {
+        const prev = s.segmentsExtra[id] ?? [];
+        const next = [...prev];
         incoming.forEach((seg, i) => {
           if (!next[i] || next[i].text !== seg.text || next[i].start !== seg.start) {
             next[i] = seg;
           }
         });
-        return s.subtitleTrack === "extra"
-          ? { segments: next, segmentsExtra: next }
-          : { segmentsExtra: next };
+        const nextMap = { ...s.segmentsExtra, [id]: next };
+        return {
+          segmentsExtra: nextMap,
+          segments: s.subtitleTrack === id ? next : s.segments,
+        };
       }),
       updateSegment: (i, patch) =>
         set((s) => {
@@ -402,16 +507,24 @@ export const useStore = create<State & Actions>()(
             }
             return merged;
           });
-          return s.subtitleTrack === "extra"
-            ? { segments: next, segmentsExtra: next }
-            : { segments: next, segmentsSource: next };
+          if (s.subtitleTrack === "source") {
+            return { segments: next, segmentsSource: next };
+          }
+          return {
+            segments: next,
+            segmentsExtra: { ...s.segmentsExtra, [s.subtitleTrack]: next },
+          };
         }),
       deleteSegment: (i) =>
         set((s) => {
           const next = s.segments.filter((_, idx) => idx !== i);
-          return s.subtitleTrack === "extra"
-            ? { segments: next, segmentsExtra: next }
-            : { segments: next, segmentsSource: next };
+          if (s.subtitleTrack === "source") {
+            return { segments: next, segmentsSource: next };
+          }
+          return {
+            segments: next,
+            segmentsExtra: { ...s.segmentsExtra, [s.subtitleTrack]: next },
+          };
         }),
       setBusy: (b) => set({ busy: b }),
       setError: (msg) => set({ error: msg }),
@@ -517,9 +630,13 @@ export const useStore = create<State & Actions>()(
           const left = { ...seg, end: t, text: leftText, words: leftWords.length ? leftWords : undefined };
           const right = { ...seg, start: t, text: rightText, words: rightWords.length ? rightWords : undefined };
           const next = [...s.segments.slice(0, idx), left, right, ...s.segments.slice(idx + 1)];
-          return s.subtitleTrack === "extra"
-            ? { segments: next, segmentsExtra: next }
-            : { segments: next, segmentsSource: next };
+          if (s.subtitleTrack === "source") {
+            return { segments: next, segmentsSource: next };
+          }
+          return {
+            segments: next,
+            segmentsExtra: { ...s.segmentsExtra, [s.subtitleTrack]: next },
+          };
         }),
       deleteCurrent: () =>
         set((s) => {
@@ -527,9 +644,13 @@ export const useStore = create<State & Actions>()(
           const idx = s.segments.findIndex((seg) => t >= seg.start && t <= seg.end);
           if (idx < 0) return {};
           const next = s.segments.filter((_, i) => i !== idx);
-          return s.subtitleTrack === "extra"
-            ? { segments: next, segmentsExtra: next }
-            : { segments: next, segmentsSource: next };
+          if (s.subtitleTrack === "source") {
+            return { segments: next, segmentsSource: next };
+          }
+          return {
+            segments: next,
+            segmentsExtra: { ...s.segmentsExtra, [s.subtitleTrack]: next },
+          };
         }),
       reset: () =>
         set({
@@ -540,9 +661,9 @@ export const useStore = create<State & Actions>()(
           videoH: 0,
           segments: [],
           segmentsSource: [],
-          segmentsExtra: [],
+          segmentsExtra: {},
           subtitleTrack: "source" as SubtitleTrack,
-          extraSubsStreaming: false,
+          extraSubsStreamingId: null,
           busy: "idle",
           error: null,
           progressPhase: "idle",
@@ -553,13 +674,7 @@ export const useStore = create<State & Actions>()(
           jobId: null,
           watermark: true,
           trimRange: { in_sec: 0, out_sec: 0, loop: false },
-          audio: {
-            sourceVolume: 1.0,
-            extraAudioId: null,
-            extraAudioName: null,
-            extraAudioDuration: 0,
-            extraVolume: 1.0,
-          },
+          audio: { sourceVolume: 1.0, extras: [] },
         }),
     }),
     {
@@ -592,7 +707,7 @@ export const useStore = create<State & Actions>()(
         subsStreaming: s.subsStreaming,
         jobId: s.jobId,
       }),
-        version: 8,
+        version: 9,
         // Historical fields migrate forward:
         //   v1→v2: `canvas` gained mode/crop_anchor/custom (Feature 1).
         //   v2→v3: `trimRange` added (Feature Trim in/out).
@@ -659,6 +774,55 @@ export const useStore = create<State & Actions>()(
             p.segmentsSource = (p.segmentsSource as unknown) ?? segs;
             p.segmentsExtra = (p.segmentsExtra as unknown) ?? [];
             p.subtitleTrack = (p.subtitleTrack as unknown) ?? "source";
+          }
+          if (version < 9) {
+            // v8→v9: multi-extra tracks.
+            //   audio: { sourceVolume, extras: [{id,name,duration,volume}] }
+            //          (was: extraAudioId/Name/Duration + extraVolume)
+            //   segmentsExtra: Record<id, Segment[]>  (was: Segment[] for the
+            //                                          single legacy track)
+            //   subtitleTrack: "source" | <extra_id>  (was: "source" | "extra")
+            //   extraSubsStreamingId: string | null   (was: extraSubsStreaming bool)
+            const oldAudio = (p.audio as Record<string, unknown> | undefined) ?? {};
+            const legacyId = oldAudio.extraAudioId as string | null | undefined;
+            const legacyName = oldAudio.extraAudioName as string | null | undefined;
+            const legacyDuration = oldAudio.extraAudioDuration as number | undefined;
+            const legacyVolume = oldAudio.extraVolume as number | undefined;
+            const sourceVolume = typeof oldAudio.sourceVolume === "number"
+              ? (oldAudio.sourceVolume as number)
+              : 1.0;
+            const extras = legacyId
+              ? [{
+                  id: legacyId,
+                  name: legacyName ?? null,
+                  duration: typeof legacyDuration === "number" ? legacyDuration : 0,
+                  volume: typeof legacyVolume === "number" ? legacyVolume : 1.0,
+                }]
+              : [];
+            p.audio = { sourceVolume, extras };
+
+            // segmentsExtra: array → Record. Legacy array belongs to the
+            // single legacy track id (if any).
+            const oldSegsExtra = p.segmentsExtra;
+            if (Array.isArray(oldSegsExtra)) {
+              p.segmentsExtra = legacyId ? { [legacyId]: oldSegsExtra } : {};
+            } else if (!oldSegsExtra || typeof oldSegsExtra !== "object") {
+              p.segmentsExtra = {};
+            }
+
+            // subtitleTrack: "extra" → legacyId; otherwise stay or fall back.
+            const oldTrack = p.subtitleTrack as string | undefined;
+            if (oldTrack === "extra") {
+              p.subtitleTrack = legacyId ?? "source";
+            } else if (typeof oldTrack !== "string") {
+              p.subtitleTrack = "source";
+            }
+
+            // extraSubsStreaming bool → extraSubsStreamingId.
+            p.extraSubsStreamingId = (p as Record<string, unknown>).extraSubsStreaming
+              ? legacyId ?? null
+              : null;
+            delete (p as Record<string, unknown>).extraSubsStreaming;
           }
           return p;
         },

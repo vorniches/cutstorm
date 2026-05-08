@@ -149,13 +149,42 @@ class Trim(BaseModel):
         return self
 
 
+class ExtraTrackRef(BaseModel):
+    """One row in `AudioMix.extras`. The id matches the file at
+    `uploads/extra_<id>.<ext>` written by /api/extra-audio."""
+    id: str = Field(..., min_length=16, max_length=16, pattern=r"^[a-f0-9]{16}$")
+    volume: float = Field(default=1.0, ge=0.0, le=2.0)
+
+
 class AudioMix(BaseModel):
     source_volume: float = Field(default=1.0, ge=0.0, le=2.0)
+    extras: list[ExtraTrackRef] = Field(default_factory=list)
+
+    # Legacy single-track fields. Pre-multi-extra clients (and saved
+    # projects) carry these instead of `extras`. The validator promotes
+    # them once and clears the legacy slots so the rest of the backend
+    # only ever reads `extras`.
     extra_audio_id: str | None = None
-    extra_volume: float = Field(default=1.0, ge=0.0, le=2.0)
+    extra_volume: float | None = None
+
+    @model_validator(mode="after")
+    def _absorb_legacy(self) -> "AudioMix":
+        if not self.extras and self.extra_audio_id:
+            self.extras = [
+                ExtraTrackRef(
+                    id=self.extra_audio_id,
+                    volume=self.extra_volume if self.extra_volume is not None else 1.0,
+                )
+            ]
+        # Don't echo legacy slots back to callers / persistence.
+        self.extra_audio_id = None
+        self.extra_volume = None
+        return self
 
 
-SubtitleTrack = Literal["source", "extra"]
+# Subtitle track is "source" or any extra_audio_id present in audio.extras.
+# Kept as a plain string in pydantic so id values aren't restricted.
+SubtitleTrack = str
 
 
 class ProjectState(BaseModel):
@@ -171,9 +200,10 @@ class ProjectState(BaseModel):
     use_subs: bool | None = None
     display_mode: str | None = None
     updated_at: float | None = None
-    # Persisted alongside the source transcript so reloading a Coub-style
-    # project shows both subtitle tracks.
-    extra_segments: list[Segment] | None = None
+    # Persisted per-track. Old projects stored this as a flat list (single
+    # extra track); new ones use a {extra_id: list[Segment]} dict. Both
+    # forms are accepted on read; new writes always use the dict form.
+    extra_segments: dict[str, list[Segment]] | list[Segment] | None = None
     subtitle_track: SubtitleTrack | None = None
 
 

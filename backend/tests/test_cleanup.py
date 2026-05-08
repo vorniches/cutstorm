@@ -165,10 +165,28 @@ def test_sweep_removes_unreferenced_extra_audio(fresh_dirs) -> None:
     uploads, _ = fresh_dirs
     stray = uploads / "extra_0000111122223333.mp3"
     stray.write_bytes(b"x")
+    # Sweep keeps fresh extras for 24h to avoid racing with the autosave
+    # debounce window during a server restart. Back-date this stray to
+    # simulate a genuinely abandoned file.
+    import os
+    import time
+    old = time.time() - (25 * 3600)
+    os.utime(stray, (old, old))
 
     counts = app_main._sweep_orphans()
     assert not stray.exists()
     assert counts["extras"] >= 1
+
+
+def test_sweep_keeps_recent_unreferenced_extra_audio(fresh_dirs) -> None:
+    """Files newer than the 24h grace period stay even if unreferenced —
+    autosave needs that window to flush the project state to disk."""
+    uploads, _ = fresh_dirs
+    fresh = uploads / "extra_0000222233334444.mp3"
+    fresh.write_bytes(b"x")
+    counts = app_main._sweep_orphans()
+    assert fresh.exists()
+    assert counts["extras"] == 0
 
 
 def test_sweep_marks_orphaned_pending_stale(fresh_dirs) -> None:

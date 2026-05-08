@@ -91,7 +91,7 @@ def _sweep_stale_meta() -> dict:
             if entry is not None and not entry[0].done():
                 continue
             data["status"] = "stale"
-            f.write_text(json.dumps(data))
+            _atomic_write_text(f, json.dumps(data))
             log.info("meta.sweep stale video_id=%s", vid)
             n += 1
     except Exception as exc:  # pragma: no cover
@@ -423,6 +423,21 @@ def _cancel_transcribes(except_video_id: str | None = None) -> None:
             task.cancel()
 
 
+def _atomic_write_text(path: Path, text: str) -> None:
+    """Write the file atomically: write to a sibling tmp, then rename. POSIX
+    rename within the same directory is atomic, so concurrent readers always
+    see either the old or the new file — never the half-written-then-half-
+    overwritten frankenstein that produced the JSONDecodeError "Extra data"
+    bug observed when autosave races with the upload finaliser."""
+    tmp = path.with_suffix(path.suffix + f".tmp-{os.getpid()}-{int(time.time() * 1000)}")
+    try:
+        tmp.write_text(text)
+        os.replace(tmp, path)
+    except Exception:
+        tmp.unlink(missing_ok=True)
+        raise
+
+
 def _update_meta(video_id: str, patch: dict) -> None:
     """Atomically merge `patch` into meta.json. Tolerant to missing file —
     callers that want initial meta already wrote it once."""
@@ -432,7 +447,7 @@ def _update_meta(video_id: str, patch: dict) -> None:
     except Exception:
         data = {}
     data.update(patch)
-    path.write_text(json.dumps(data))
+    _atomic_write_text(path, json.dumps(data))
 
 
 async def _run_transcribe_stream(
@@ -530,7 +545,7 @@ async def _run_transcribe_stream(
     on_disk["status"] = "done"
     on_disk["percent"] = 100
     on_disk["job_id"] = jid
-    _meta_path(video_id).write_text(json.dumps(on_disk))
+    _atomic_write_text(_meta_path(video_id), json.dumps(on_disk))
 
     ws.push(jid, {
         "phase": "transcribe_done",
@@ -620,7 +635,7 @@ def _finalize_uploaded_media(
     initial_meta["status"] = "done" if not generate_subs else "pending"
     initial_meta["percent"] = 100 if not generate_subs else 0
     initial_meta["job_id"] = jid
-    meta_file.write_text(json.dumps(initial_meta))
+    _atomic_write_text(meta_file, json.dumps(initial_meta))
 
     if generate_subs:
         loop = asyncio.get_running_loop()
@@ -1023,7 +1038,7 @@ def update_transcript(video_id: str, req: UpdateSegmentsRequest) -> dict:
         data["project"] = existing
         changed.append("project")
 
-    meta.write_text(json.dumps(data))
+    _atomic_write_text(meta, json.dumps(data))
     log.info("transcripts.updated video_id=%s changed=%s", video_id, ",".join(changed) or "none")
     return {"ok": True}
 
@@ -1031,7 +1046,8 @@ def update_transcript(video_id: str, req: UpdateSegmentsRequest) -> dict:
 def _referenced_extra_ids() -> set[str]:
     """Scan all project meta files for extra_audio_id references. Used by
     delete + orphan-sweep to avoid removing an extra audio file that another
-    project still points at."""
+    project still points at. Reads BOTH the legacy single-track form
+    (`audio.extra_audio_id`) and the multi-track form (`audio.extras: list`)."""
     ids: set[str] = set()
     try:
         for f in UPLOADS_DIR.glob("*.json"):
@@ -1039,9 +1055,19 @@ def _referenced_extra_ids() -> set[str]:
                 data = json.loads(f.read_text())
             except Exception:
                 continue
-            pid = ((data.get("project") or {}).get("audio") or {}).get("extra_audio_id")
-            if pid:
-                ids.add(pid)
+            audio = (data.get("project") or {}).get("audio") or {}
+            # Legacy single-track form
+            legacy = audio.get("extra_audio_id")
+            if legacy:
+                ids.add(legacy)
+            # Multi-track form
+            for entry in audio.get("extras") or []:
+                if isinstance(entry, dict):
+                    eid = entry.get("id")
+                    if eid:
+                        ids.add(eid)
+                elif isinstance(entry, str):
+                    ids.add(entry)
     except Exception:  # pragma: no cover
         pass
     return ids
@@ -1122,13 +1148,26 @@ def delete_transcript(video_id: str, drop_video: bool = False) -> dict:
     for key in [k for k in list(_peaks_cache.keys()) if k[0] == f"v:{video_id}"]:
         _peaks_cache.pop(key, None)
 
-    # Extra audio: delete only if no OTHER project references it.
-    extra_id = ((meta_data.get("project") or {}).get("audio") or {}).get("extra_audio_id")
-    if extra_id:
-        still_in_use = extra_id in _referenced_extra_ids()
-        if not still_in_use:
+    # Extra audio: collect ALL ids this project owns (legacy single field
+    # plus the multi-track `extras` list), and drop the file for any id
+    # that no OTHER project still references.
+    audio_meta = (meta_data.get("project") or {}).get("audio") or {}
+    extra_ids_owned: list[str] = []
+    legacy_extra = audio_meta.get("extra_audio_id")
+    if legacy_extra:
+        extra_ids_owned.append(legacy_extra)
+    for entry in audio_meta.get("extras") or []:
+        if isinstance(entry, dict) and entry.get("id"):
+            extra_ids_owned.append(entry["id"])
+        elif isinstance(entry, str):
+            extra_ids_owned.append(entry)
+    if extra_ids_owned:
+        still_referenced = _referenced_extra_ids()
+        for eid in extra_ids_owned:
+            if eid in still_referenced:
+                continue
             for ext in _AUDIO_EXTS:
-                p = UPLOADS_DIR / f"extra_{extra_id}.{ext}"
+                p = UPLOADS_DIR / f"extra_{eid}.{ext}"
                 if p.exists():
                     p.unlink()
                     removed.append("extra_audio")
@@ -1546,7 +1585,7 @@ async def api_export(
     jid = job_id or x_job_id
     t0 = time.perf_counter()
     log.info(
-        "export.request video_id=%s mode=%s segments=%d trim_silences=%s trim=(%.2f,%.2f) audio=(src=%.2f,extra=%s) job_id=%s",
+        "export.request video_id=%s mode=%s segments=%d trim_silences=%s trim=(%.2f,%.2f) audio=(src=%.2f,extras=%d) subtitle_track=%s job_id=%s",
         req.video_id,
         req.style.mode,
         len(req.segments),
@@ -1554,7 +1593,8 @@ async def api_export(
         req.trim.in_sec,
         req.trim.out_sec,
         req.audio.source_volume,
-        req.audio.extra_audio_id,
+        len(req.audio.extras),
+        req.subtitle_track,
         jid,
     )
     media = _find_media_file(req.video_id)
@@ -1579,11 +1619,28 @@ async def api_export(
     edge_trim_active = (trim_in > 0.01) or (trim_out < info.duration - 0.01)
     clipped_duration = trim_out - trim_in
 
+    # Resolve the active subtitle track. "source" is the source-video
+    # transcript; any extra_audio_id present in audio.extras maps onto that
+    # extra. An unknown id (e.g. user removed the extra but client still
+    # sent its old id) falls back to "source" silently.
+    extras_ids = {e.id for e in req.audio.extras}
+    if req.subtitle_track == "source":
+        effective_subtitle_track = "source"
+    elif req.subtitle_track in extras_ids:
+        effective_subtitle_track = req.subtitle_track
+    else:
+        if req.subtitle_track:
+            log.warning(
+                "export.unknown_subtitle_track id=%s — falling back to source",
+                req.subtitle_track,
+            )
+        effective_subtitle_track = "source"
+
     segments_for_render = req.segments
-    # Extra-track subtitles ride the master extra-audio timeline; they are
-    # NOT clipped to the source video's trim window (their timestamps refer
-    # to the extra audio, not to the original video).
-    if edge_trim_active and req.subtitle_track != "extra":
+    # Source-track subtitles are tied to the source video timeline and need
+    # clipping when the user trimmed in/out. Extra-track subtitles ride the
+    # extra-audio timeline as-is and must NOT be clipped.
+    if edge_trim_active and effective_subtitle_track == "source":
         segments_for_render = _clip_segments_to_trim(req.segments, trim_in, trim_out)
 
     keeps: list[tuple[float, float]] | None = None
@@ -1604,48 +1661,62 @@ async def api_export(
             clipped_duration,
         )
 
-    # ---- resolve extra audio (optional) ----
-    extra_audio_path: Path | None = None
-    if req.audio.extra_audio_id:
-        extra_audio_path = _find_extra_audio(req.audio.extra_audio_id)
-        if extra_audio_path is None:
-            # Hard-fail when the user explicitly relies on the track for
-            # loop-mode duration; soft-warn when it's just a mix that we can
-            # render without (so the export still produces something usable).
-            if req.trim.loop:
-                log.warning(
-                    "export.extra_audio_missing id=%s loop=true — refusing export",
-                    req.audio.extra_audio_id,
-                )
-                raise HTTPException(
-                    status_code=410,
-                    detail=(
-                        "Extra audio track is missing on the server "
-                        "(file was cleaned up). Re-upload it before "
-                        "exporting in loop mode."
-                    ),
-                )
-            log.warning("export.extra_audio_missing id=%s — proceeding without mix", req.audio.extra_audio_id)
+    # ---- resolve extras list (multi-track) ----
+    # Each entry becomes (Path, volume) for the renderer. Missing files are
+    # dropped with a warning; in loop mode the FIRST track is the duration
+    # driver, so if it's the missing one we hard-fail (no point rendering a
+    # loop without a length).
+    resolved_extras: list[tuple[Path, float]] = []
+    missing_extra_ids: list[str] = []
+    for e in req.audio.extras:
+        p = _find_extra_audio(e.id)
+        if p is None:
+            missing_extra_ids.append(e.id)
+            continue
+        resolved_extras.append((p, e.volume))
+    if missing_extra_ids:
+        log.warning("export.extras_missing ids=%s", missing_extra_ids)
 
-    # ---- loop mode (Coub-style): repeat the trimmed slice across the extra
-    # audio's full duration. Only active when both sides agree.
-    loop_active = bool(req.trim.loop) and extra_audio_path is not None and not info.is_audio_only
+    if req.trim.loop:
+        first_id = req.audio.extras[0].id if req.audio.extras else None
+        first_path = (
+            resolved_extras[0][0]
+            if resolved_extras and (first_id is not None and first_id not in missing_extra_ids)
+            else None
+        )
+        if first_path is None:
+            log.warning(
+                "export.loop_driver_missing first_id=%s missing=%s — refusing export",
+                first_id, missing_extra_ids,
+            )
+            raise HTTPException(
+                status_code=410,
+                detail=(
+                    "Loop track is missing on the server (file was cleaned "
+                    "up). Re-upload the first extra track or turn loop off."
+                ),
+            )
+
+    # ---- loop mode (Coub-style): repeat the trimmed slice across the FIRST
+    # extra track's full duration. ----
+    loop_active = bool(req.trim.loop) and len(resolved_extras) > 0 and not info.is_audio_only
     loop_total_duration: float | None = None
     if loop_active:
+        driver_path, _vol = resolved_extras[0]
         try:
-            extra_info = probe(extra_audio_path)
-            extra_dur = float(extra_info.duration)
+            driver_info = probe(driver_path)
+            driver_dur = float(driver_info.duration)
         except Exception as exc:
-            log.warning("export.loop_probe_failed extra=%s err=%s", extra_audio_path, exc)
-            extra_dur = 0.0
-        if extra_dur > 0:
+            log.warning("export.loop_probe_failed extra=%s err=%s", driver_path, exc)
+            driver_dur = 0.0
+        if driver_dur > 0:
             loop_clip_duration = clipped_duration  # short slice
-            loop_total_duration = extra_dur
-            new_duration = extra_dur
+            loop_total_duration = driver_dur
+            new_duration = driver_dur
             # Source-track subtitles: stamp copies onto each iteration so each
             # loop displays them. Extra-track subtitles already ride the
-            # master extra-audio timeline and need no expansion.
-            if req.subtitle_track == "source":
+            # driver extra-audio timeline and need no expansion.
+            if effective_subtitle_track == "source":
                 from .loop_segments import expand_loop_segments
                 segments_for_render = expand_loop_segments(
                     segments_for_render,
@@ -1655,15 +1726,15 @@ async def api_export(
                 )
             log.info(
                 "export.loop active clip=%.2fs total=%.2fs subtitle_track=%s",
-                loop_clip_duration, loop_total_duration, req.subtitle_track,
+                loop_clip_duration, loop_total_duration, effective_subtitle_track,
             )
         else:
             loop_active = False  # bail out, treat as normal export
 
     log.info(
-        "export.render start target=%dx%d audio_only=%s duration=%.2fs trim_edges=(%.2f,%.2f) extra_audio=%s loop=%s",
+        "export.render start target=%dx%d audio_only=%s duration=%.2fs trim_edges=(%.2f,%.2f) extras=%d loop=%s",
         resolved.target_w, resolved.target_h, info.is_audio_only, new_duration,
-        trim_in, trim_out, extra_audio_path, loop_active,
+        trim_in, trim_out, len(resolved_extras), loop_active,
     )
 
     out = _output_path(req.video_id)
@@ -1686,7 +1757,7 @@ async def api_export(
     trim_active = keeps is not None
     canvas_transform = bool(resolved.ffmpeg_filter)
     audio_mix_active = (
-        extra_audio_path is not None or abs(req.audio.source_volume - 1.0) > 1e-3
+        len(resolved_extras) > 0 or abs(req.audio.source_volume - 1.0) > 1e-3
     )
 
     trim_duration_arg = clipped_duration if edge_trim_active else None
@@ -1738,8 +1809,7 @@ async def api_export(
                 trim_in=trim_in,
                 trim_duration=loop_trim_duration_arg,
                 source_volume=req.audio.source_volume,
-                extra_audio=extra_audio_path,
-                extra_volume=req.audio.extra_volume,
+                extras=resolved_extras,
                 watermark_path=watermark_path,
                 source_has_audio=info.has_audio,
                 loop_total_duration=loop_total_duration,
@@ -1767,8 +1837,7 @@ async def api_export(
             trim_in=trim_in,
             trim_duration=loop_trim_duration_arg,
             source_volume=req.audio.source_volume,
-            extra_audio=extra_audio_path,
-            extra_volume=req.audio.extra_volume,
+            extras=resolved_extras,
             watermark=wm_active,
             source_has_audio=info.has_audio,
             loop_total_duration=loop_total_duration,

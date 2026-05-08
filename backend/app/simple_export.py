@@ -52,8 +52,7 @@ def run_filter_only(
     trim_in: float = 0.0,
     trim_duration: float | None = None,
     source_volume: float = 1.0,
-    extra_audio: Path | None = None,
-    extra_volume: float = 1.0,
+    extras: list[tuple[Path, float]] | None = None,
     watermark_path: Path | None = None,
     source_has_audio: bool = True,
     loop_total_duration: float | None = None,
@@ -64,13 +63,15 @@ def run_filter_only(
     Re-encodes video through the same libx264 settings as the renderer path
     (crf=16, preset=slow, yuv420p) so outputs stay visually consistent.
 
-    `trim_in` / `trim_duration` apply as input-seek on the source input.
-    `source_volume` / `extra_audio` / `extra_volume` apply an audio mix.
-    `loop_total_duration` (Coub-mode) extends the trimmed slice to that total
-    by repeating both the video and the source-audio buffers via the `loop`
-    /`aloop` filters; extra audio rides the master timeline as-is.
+    Inputs:
+        [0:v] / [0:a]   — source video / source audio
+        [1:a], [2:a]... — extras (in order)
+        [N+1:v]         — watermark PNG (if enabled), N = len(extras)
     """
+    extras = list(extras or [])
+    n_extras = len(extras)
     out.parent.mkdir(parents=True, exist_ok=True)
+
     pre = f"select='{select_expr}',setpts=N/FRAME_RATE/TB," if select_expr else ""
     chain_main = canvas_filter if canvas_filter else f"scale={target_w}:{target_h}"
 
@@ -83,16 +84,12 @@ def run_filter_only(
     loop_video_suffix = ""
     loop_audio_suffix = ""
     if loop_active:
-        # loop filter buffers `size` frames of the (already trimmed) input,
-        # then emits them on repeat. We pin size to exactly the clip length
-        # so the buffer doesn't grow unboundedly in RAM.
         frames_in_clip = max(1, int(round(trim_duration * fps)) + 2)
         loop_video_suffix = (
             f",loop=loop=-1:size={frames_in_clip}:start=0"
             f",trim=duration={loop_total_duration:.3f}"
             f",setpts=N/FRAME_RATE/TB"
         )
-        # Audio loop: assume 48 kHz, +1024 sample headroom for fenceposts.
         samples_in_clip = max(1, int(round(trim_duration * 48000)) + 1024)
         loop_audio_suffix = (
             f",aloop=loop=-1:size={samples_in_clip}:start=0"
@@ -100,88 +97,87 @@ def run_filter_only(
             f",asetpts=N/SR/TB"
         )
 
-    # Video chain: process source → canvas → optionally composite watermark.
-    # Watermark is 16% of the canvas width, placed bottom-right with 2%/3%
-    # margin. ffmpeg's overlay filter understands W/H (main) and w/h (overlay).
     has_watermark = watermark_path is not None and watermark_path.exists()
     if has_watermark:
-        wm_input_idx = 2 if extra_audio is not None else 1
+        # Watermark is the LAST input, after all extras.
+        wm_input_idx = 1 + n_extras
         wm_w = max(1, int(target_w * 0.16))
         margin_x = max(1, int(target_w * 0.02))
         margin_y = max(1, int(target_h * 0.03))
-        filter_complex = (
+        video_chain = (
             f"[0:v]{pre}{chain_main}{loop_video_suffix}[vbase];"
             f"[{wm_input_idx}:v]scale={wm_w}:-1[wm];"
-            # shortest=1 + repeatlast=0: overlay stops emitting frames the
-            # moment the base video ends. Without this the looped PNG keeps
-            # the overlay filter producing frames forever — the encoder
-            # never reaches EOF and the output file grows indefinitely.
             f"[vbase][wm]overlay=W-w-{margin_x}:H-h-{margin_y}:shortest=1:repeatlast=0[v]"
         )
     else:
-        filter_complex = f"[0:v]{pre}{chain_main}{loop_video_suffix}[v]"
+        video_chain = f"[0:v]{pre}{chain_main}{loop_video_suffix}[v]"
 
-    has_extra = extra_audio is not None
-    # When source has no audio stream (e.g. screen recording, mute camera),
-    # referencing [0:a] in the filter graph fails hard with "stream specifier
-    # ':a' matches no streams". Branches below only touch [0:a] when the
-    # source actually has an audio track.
     needs_audio_encode = (
-        (has_extra)
+        n_extras > 0
         or (source_has_audio and abs(source_volume - 1.0) > 1e-3)
         or (source_has_audio and select_expr is not None)
+        or (source_has_audio and loop_active)
     )
 
-    if select_expr and source_has_audio:
-        # silence-trim takes precedence for timing; volume/mix still apply after.
-        src_audio_chain = (
-            f"aselect='{select_expr}',asetpts=N/SR/TB"
-            f"{loop_audio_suffix},volume={source_volume:.3f}"
-        )
-    elif loop_active:
-        # Strip the leading comma since this is the start of the chain.
-        src_audio_chain = (
-            f"{loop_audio_suffix.lstrip(',')}"
-            f",volume={source_volume:.3f}"
-        )
-    else:
-        src_audio_chain = f"volume={source_volume:.3f}"
-    src_audio = f"[0:a]{src_audio_chain}"
+    audio_lanes: list[str] = []
+    audio_labels: list[str] = []
+    if source_has_audio and needs_audio_encode:
+        if select_expr:
+            src_chain = (
+                f"[0:a]aselect='{select_expr}',asetpts=N/SR/TB"
+                f"{loop_audio_suffix},volume={source_volume:.3f},apad[a_src]"
+            )
+        elif loop_active:
+            src_chain = (
+                f"[0:a]{loop_audio_suffix.lstrip(',')}"
+                f",volume={source_volume:.3f},apad[a_src]"
+            )
+        else:
+            src_chain = f"[0:a]volume={source_volume:.3f},apad[a_src]"
+        audio_lanes.append(src_chain)
+        audio_labels.append("[a_src]")
 
-    if has_extra and source_has_audio:
-        # Mix source + extra.
-        filter_complex += f";{src_audio}[a0];[1:a]volume={extra_volume:.3f}[a1];[a0][a1]amix=inputs=2:duration=first:normalize=0[a]"
-        audio_map = ["-map", "[a]", "-c:a", "aac", "-b:a", "192k"]
-    elif has_extra:
-        # Source is silent — extra becomes the only audio stream.
-        filter_complex += f";[1:a]volume={extra_volume:.3f}[a]"
-        audio_map = ["-map", "[a]", "-c:a", "aac", "-b:a", "192k"]
-    elif source_has_audio and needs_audio_encode:
-        filter_complex += f";{src_audio}[a]"
-        audio_map = ["-map", "[a]", "-c:a", "aac", "-b:a", "192k"]
-    elif source_has_audio:
-        # No processing needed — copy source audio stream through.
-        audio_map = ["-map", "0:a?", "-c:a", "copy"]
-    else:
-        # No source audio and no extra — produce a silent MP4.
+    for i, (_p, vol) in enumerate(extras):
+        idx = 1 + i  # extras start at input index 1 (after source)
+        label = f"[a_e{i}]"
+        audio_lanes.append(f"[{idx}:a]volume={vol:.3f},apad{label}")
+        audio_labels.append(label)
+
+    if not audio_labels:
+        audio_filter = ""
         audio_map = ["-an"]
+    elif len(audio_labels) == 1:
+        only = audio_lanes[0]
+        renamed = only.rsplit("[", 1)[0] + "[a]"
+        audio_filter = ";" + renamed
+        audio_map = ["-map", "[a]", "-c:a", "aac", "-b:a", "192k"]
+    else:
+        amix_in = "".join(audio_labels)
+        audio_filter = (
+            ";" + ";".join(audio_lanes)
+            + f";{amix_in}amix=inputs={len(audio_labels)}:duration=longest:normalize=0[a]"
+        )
+        audio_map = ["-map", "[a]", "-c:a", "aac", "-b:a", "192k"]
+
+    if not needs_audio_encode and source_has_audio:
+        # Copy source audio stream through unchanged.
+        audio_filter = ""
+        audio_map = ["-map", "0:a?", "-c:a", "copy"]
+
+    filter_complex = video_chain + audio_filter
 
     cmd = ["ffmpeg", "-y", "-nostats", "-loglevel", "error"]
-    # Apply trim to the source input (and extra input) via input-seek.
     if trim_in > 0.0:
         cmd += ["-ss", f"{trim_in:.3f}"]
     if trim_duration is not None and trim_duration > 0.0:
         cmd += ["-t", f"{trim_duration:.3f}"]
     cmd += ["-i", str(source)]
-    if has_extra:
-        # In loop mode the extra audio drives the master timeline — do NOT
-        # cap it at trim_duration. Without loop, mirror the source trim so
-        # both inputs match the video clip length.
-        if not loop_active and trim_duration is not None and trim_duration > 0.0:
-            cmd += ["-t", f"{trim_duration:.3f}"]
-        cmd += ["-i", str(extra_audio)]
+    for path, _vol in extras:
+        # In loop mode the FIRST extra drives total length, do not cap any
+        # extra. In non-loop mode each extra is padded by `apad`, so capping
+        # would needlessly truncate them — skip the -t too.
+        cmd += ["-i", str(path)]
     if has_watermark:
-        # Single PNG, loop so overlay persists for the whole clip.
         cmd += ["-loop", "1", "-i", str(watermark_path)]
     cmd += [
         "-filter_complex", filter_complex,
@@ -191,13 +187,10 @@ def run_filter_only(
         "-preset", "slow",
         "-crf", "16",
     ]
-    # -shortest stops encoding when the shortest input ends; otherwise the
-    # looped watermark PNG (or aloop'd source) would extend the video
-    # forever. In loop mode atrim/trim filters already cap the duration,
-    # but -shortest is still cheap insurance.
-    if has_watermark or loop_active:
-        cmd += ["-shortest"]
-    cmd += [str(out)]
+    # -shortest keeps output bounded: the watermark loop / aloop chains
+    # are infinite, the source video and (in loop mode) the looped video
+    # chain are not. Without -shortest the encoder would never reach EOF.
+    cmd += ["-shortest", str(out)]
     log.info("simple_export.filter_only cmd=%s", " ".join(cmd))
     _run(cmd)
     if on_progress is not None:
