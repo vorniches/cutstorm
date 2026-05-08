@@ -275,7 +275,7 @@ export function SubtitleOverlay({ videoRef, renderMode = false, currentTimeOverr
                 style={{
                   color: active ? style.active_word_color : undefined,
                   fontWeight: active ? 700 : undefined,
-                  transition: "color 80ms ease",
+                  transition: renderMode ? "none" : "color 80ms ease",
                 }}
               >
                 {w.text}

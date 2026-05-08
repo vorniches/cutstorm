@@ -26,7 +26,7 @@ log = logging.getLogger(__name__)
 
 ProgressCb = Callable[[int], None]
 
-RENDER_FPS = 30
+RENDER_FPS = 60
 RENDER_URL = "http://127.0.0.1:8000/?render=1"
 
 
@@ -58,7 +58,7 @@ def _build_render_state(
 
 
 def _dedup_enabled() -> bool:
-    return os.environ.get("CUTSTORM_DEDUP", "1") != "0"
+    return os.environ.get("CUTSTORM_DEDUP", "0") != "0"
 
 
 async def _capture_frames(
